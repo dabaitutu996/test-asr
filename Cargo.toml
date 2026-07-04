@@ -1,0 +1,14 @@
+[package]
+name = "asr-compare-tui"
+version = "0.1.0"
+edition = "2021"
+description = "ASR 模型对比 TUI 工具：采集系统音频，实时对比多个 Sherpa 流式模型的识别效果"
+
+[dependencies]
+arcvoice-core = { path = "../../game-video/engine/crates/core", features = ["sherpa-onnx-models", "system-audio"] }
+anyhow = "1"
+ratatui = "0.28"
+crossterm = "0.28"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
