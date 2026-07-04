@@ -89,7 +89,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arcvoice-core",
+ "cpal",
  "crossterm",
+ "hound",
  "ratatui",
  "tokio",
  "tracing",
