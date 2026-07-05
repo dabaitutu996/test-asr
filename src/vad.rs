@@ -13,6 +13,39 @@ use crate::config::{
 };
 use crate::util::{push_log, rms, with_stdout_suppressed};
 
+// ─── Silero VAD 工厂函数 ─────────────────────────────────────────────────
+
+/// 创建一个独立的 Silero VAD 检测器，供在线槽或外部使用。
+/// 参数由调用方指定（不读环境变量），方便不同场景复用。
+/// 在线槽的"收尾 VAD"也用这个函数，只是参数不同（例如 min_silence 300ms）。
+pub(crate) fn create_silero_vad(
+    model_path: &std::path::Path,
+    threshold: f32,
+    min_silence_sec: f32,
+    min_speech_sec: f32,
+    max_speech_sec: f32,
+    buffer_sec: f32,
+) -> Result<VoiceActivityDetector> {
+    let cfg = VadModelConfig {
+        silero_vad: SileroVadModelConfig {
+            model: Some(model_path.to_string_lossy().into_owned()),
+            threshold,
+            min_silence_duration: min_silence_sec,
+            min_speech_duration: min_speech_sec,
+            window_size: SILERO_VAD_WINDOW_SIZE,
+            max_speech_duration: max_speech_sec,
+        },
+        ten_vad: Default::default(),
+        sample_rate: VAD_SAMPLE_RATE as i32,
+        num_threads: 1,
+        provider: Some("cpu".into()),
+        debug: false,
+    };
+    with_stdout_suppressed(|| {
+        VoiceActivityDetector::create(&cfg, buffer_sec).context("创建 Silero VoiceActivityDetector 失败")
+    })
+}
+
 pub(crate) struct VadSegment {
     pub(crate) start_sample: usize,
     pub(crate) samples: Vec<f32>,
@@ -241,25 +274,14 @@ impl SileroVadState {
                 settings.model_path.display()
             );
         }
-        let cfg = VadModelConfig {
-            silero_vad: SileroVadModelConfig {
-                model: Some(settings.model_path.to_string_lossy().into_owned()),
-                threshold: settings.threshold,
-                min_silence_duration: settings.min_silence_sec,
-                min_speech_duration: settings.min_speech_sec,
-                window_size: SILERO_VAD_WINDOW_SIZE,
-                max_speech_duration: settings.max_speech_sec,
-            },
-            ten_vad: Default::default(),
-            sample_rate: VAD_SAMPLE_RATE as i32,
-            num_threads: 1,
-            provider: Some("cpu".into()),
-            debug: false,
-        };
-        let detector = with_stdout_suppressed(|| {
-            VoiceActivityDetector::create(&cfg, SILERO_VAD_BUFFER_SEC)
-                .context("创建 Silero VoiceActivityDetector 失败")
-        })?;
+        let detector = create_silero_vad(
+            &settings.model_path,
+            settings.threshold,
+            settings.min_silence_sec,
+            settings.min_speech_sec,
+            settings.max_speech_sec,
+            SILERO_VAD_BUFFER_SEC,
+        )?;
         Ok(Self { detector, settings })
     }
 

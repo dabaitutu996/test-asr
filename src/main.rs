@@ -27,6 +27,7 @@ mod engine;
 mod media;
 mod models;
 mod report;
+mod segments;
 mod ui;
 mod util;
 mod vad;
@@ -72,9 +73,9 @@ fn main() -> Result<()> {
         prev_hook(info);
     }));
 
-    // 阶段 1：选择引擎。
-    let indices = match run_selection_screen(&mut terminal)? {
-        Some(i) => i,
+    // 阶段 1：选择引擎 + 切句配置。
+    let (indices, seg_config) = match run_selection_screen(&mut terminal)? {
+        Some((idx, cfg)) => (idx, cfg),
         None => {
             disable_raw_mode()?;
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -88,7 +89,8 @@ fn main() -> Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
         let names: Vec<&str> = indices.iter().map(|&i| MODEL_DESCS[i].name).collect();
-        let msg = format!(" 正在加载: {} ... ", names.join(", "));
+        let cfg_tag = if seg_config.is_some() { " · 加强版" } else { "" };
+        let msg = format!(" 正在加载: {} ... {cfg_tag}", names.join(", "));
         let loading = Paragraph::new(Line::from(Span::styled(
             msg,
             Style::default()
@@ -101,7 +103,13 @@ fn main() -> Result<()> {
 
     let mut slots = Vec::with_capacity(indices.len());
     for &i in &indices {
-        slots.push(AnySlot::build(&MODEL_DESCS[i])?);
+        // 只有流式模型（且选了加强配置的）才传 seg_config
+        let model_config = if matches!(MODEL_DESCS[i].kind, crate::models::SlotKind::Online(_)) {
+            seg_config.as_ref()
+        } else {
+            None
+        };
+        slots.push(AnySlot::build_with_config(&MODEL_DESCS[i], model_config)?);
     }
     let has_offline_slots = slots.iter().any(|slot| !slot.is_online());
     let vad = VadState::new(has_offline_slots)?;

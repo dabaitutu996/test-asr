@@ -58,6 +58,58 @@ pub(crate) fn export_report(app: &App) -> Result<PathBuf> {
 
     app.vad.append_report(&mut out);
 
+    // ── Segmenter 统计 ──
+    for slot in &app.slots {
+        if let AnySlot::Online(s) = slot {
+            if let Some(ref seg) = s.segmenter {
+                out.push_str("\n## Segmentation Stats\n\n");
+                out.push_str(&format!("- config: {}\n", seg.config.name));
+                out.push_str(&format!(
+                    "- punct_candidate_count: {}\n",
+                    seg.stats.punct_candidate_count
+                ));
+                out.push_str(&format!(
+                    "- punct_success_count: {}\n",
+                    seg.stats.punct_success_count
+                ));
+                out.push_str(&format!(
+                    "- punct_regret_count: {}\n",
+                    seg.stats.punct_regret_count
+                ));
+                out.push_str(&format!(
+                    "- no_punct_fallback_count: {}\n",
+                    seg.stats.no_punct_fallback_count
+                ));
+                out.push_str(&format!(
+                    "- extreme_cut_count: {}\n",
+                    seg.stats.extreme_cut_count
+                ));
+                out.push_str(&format!(
+                    "- avg_cut_latency_ms: {:.1}\n",
+                    seg.stats.avg_cut_latency_ms()
+                ));
+                out.push_str(&format!(
+                    "- avg_words_per_segment: {:.1}\n",
+                    seg.stats.avg_words_per_segment()
+                ));
+                out.push_str(&format!(
+                    "- repeat_risk_count: {}\n",
+                    seg.stats.repeat_risk_count
+                ));
+                out.push_str(&format!(
+                    "- missing_word_risk_count: {}\n",
+                    seg.stats.missing_word_risk_count
+                ));
+                out.push_str(&format!(
+                    "- total_segment_count: {}\n",
+                    seg.stats.total_segment_count
+                ));
+                out.push('\n');
+                break; // 目前只支持一个 segmenter
+            }
+        }
+    }
+
     out.push_str("\n## ASR Results\n");
     for slot in &app.slots {
         out.push_str(&format!("\n### {}\n\n", slot.name()));

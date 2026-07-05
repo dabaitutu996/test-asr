@@ -139,18 +139,39 @@ pub(crate) fn draw(app: &App, frame: &mut ratatui::Frame) {
         frame.render_widget(finals_para, col_layout[1]);
     }
 
-    let log_lines: Vec<Line> = app
-        .log
+    // ── 底部日志 + segmenter 统计（如有）──
+    let mut log_lines: Vec<Line> = Vec::new();
+
+    // 收集 segmenter 统计摘要（所有启用了自定义 endpoint 的在线槽）
+    let stats_summary: Option<String> = app
+        .slots
         .iter()
-        .rev()
-        .take(5)
-        .map(|s| Line::from(s.clone()))
-        .collect();
-    let log_para = Paragraph::new(log_lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("日志（最近 endpoint）"),
-    );
+        .find_map(|slot| match slot {
+            crate::engine::AnySlot::Online(s) if s.use_custom_endpoint => {
+                s.segmenter.as_ref().map(|seg| seg.stats.summary_line())
+            }
+            _ => None,
+        });
+
+    if let Some(ref summary) = stats_summary {
+        log_lines.push(Line::from(Span::styled(
+            summary.clone(),
+            Style::default().fg(Color::Cyan),
+        )));
+        log_lines.push(Line::from(""));
+    }
+
+    for s in app.log.iter().rev().take(if stats_summary.is_some() { 4 } else { 5 }) {
+        log_lines.push(Line::from(s.clone()));
+    }
+    let log_title = if stats_summary.is_some() {
+        "日志 · 切句统计"
+    } else {
+        "日志（最近 endpoint）"
+    };
+    let log_para = Paragraph::new(log_lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(log_title));
     frame.render_widget(log_para, chunks[2]);
 }
 

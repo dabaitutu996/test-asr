@@ -29,9 +29,9 @@ impl AnySlot {
         matches!(self, AnySlot::Online(_))
     }
 
-    pub(crate) fn build(desc: &ModelDesc) -> Result<Self> {
+    pub(crate) fn build_with_config(desc: &ModelDesc, seg_config: Option<&crate::segments::SegConfig>) -> Result<Self> {
         match desc.kind {
-            SlotKind::Online(_) => Ok(Self::Online(build_online_slot(desc)?)),
+            SlotKind::Online(_) => Ok(Self::Online(build_online_slot(desc, seg_config)?)),
             SlotKind::Offline(_) => Ok(Self::Offline(build_offline_slot(desc)?)),
         }
     }
@@ -80,6 +80,14 @@ impl SlotView for OnlineSlot {
         self.finals.clear();
         self.all_finals.clear();
         self.finals_scroll = 0;
+        // 自定义 endpoint 状态也一并重置
+        if let Some(ref mut seg) = self.segmenter {
+            seg.on_stream_reset(std::time::Instant::now());
+        }
+        if let Some(ref mut vad) = self.tail_vad {
+            vad.clear();
+            vad.reset();
+        }
     }
 }
 
