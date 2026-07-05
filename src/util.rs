@@ -1,4 +1,4 @@
-//! 跨模块共用的小工具：stdout 屏蔽、RMS、耗时格式化、日志追加。
+//! 跨模块共用的小工具：stdout/stderr 屏蔽、RMS、耗时格式化、日志追加。
 
 use std::os::unix::io::RawFd;
 use std::time::Instant;
@@ -39,6 +39,56 @@ pub(crate) fn with_stdout_suppressed<F: FnOnce() -> R, R>(f: F) -> R {
         match result {
             Ok(val) => val,
             Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+}
+
+/// 持久重定向 stderr 到 /dev/null（不影响 stdout，TUI 渲染需要 stdout）。
+/// 返回一个 guard，drop 时自动恢复 stderr。
+/// 用于主循环期间屏蔽 Sherpa/ONNX Runtime 后台线程的 C++ 日志。
+pub(crate) struct StderrSuppressGuard {
+    saved: RawFd,
+}
+
+impl StderrSuppressGuard {
+    pub(crate) fn new() -> Self {
+        // FFI 声明（模块级 extern block 在 impl 块内可见）
+        extern "C" {
+            fn dup(fd: RawFd) -> RawFd;
+            fn dup2(oldfd: RawFd, newfd: RawFd) -> RawFd;
+            fn close(fd: RawFd) -> RawFd;
+            fn open(path: *const u8, oflag: RawFd, ...) -> RawFd;
+        }
+        const O_WRONLY: RawFd = 1;
+
+        let saved = unsafe { dup(2) };
+        if saved < 0 {
+            // fd 耗尽等极端情况：放弃抑制，guard 为 no-op
+            return Self { saved: -1 };
+        }
+        unsafe {
+            let dev_null = open(b"/dev/null\0".as_ptr(), O_WRONLY);
+            if dev_null >= 0 {
+                dup2(dev_null, 2);
+                close(dev_null);
+            }
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for StderrSuppressGuard {
+    fn drop(&mut self) {
+        if self.saved < 0 {
+            return;
+        }
+        extern "C" {
+            fn dup2(oldfd: RawFd, newfd: RawFd) -> RawFd;
+            fn close(fd: RawFd) -> RawFd;
+        }
+        unsafe {
+            dup2(self.saved, 2);
+            close(self.saved);
         }
     }
 }

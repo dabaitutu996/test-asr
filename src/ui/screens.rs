@@ -17,14 +17,13 @@ use asr_compare_tui::system_audio::OutputDevice;
 
 use crate::capture::{list_inputs, list_outputs, list_sample_files, Capture, DevicePick};
 use crate::models::{SlotKind, MODEL_DESCS};
-use crate::segments::{SegConfig, SEG_CONFIG_ENHANCED_ZIPFORMER_EN};
 use crate::util::rms;
 
 // ─── 启动选择界面 ─────────────────────────────────────────────────────
 
 pub(crate) fn run_selection_screen(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-) -> Result<Option<(Vec<usize>, Option<SegConfig>)>> {
+) -> Result<Option<Vec<usize>>> {
     // 每个模型是否就绪：流式模型恒 true，离线模型检测文件是否齐全。
     // 不就绪的模型在选择屏打灰、不可勾选（优雅降级）。
     let available: Vec<bool> = MODEL_DESCS.iter().map(|d| d.files_present()).collect();
@@ -37,21 +36,14 @@ pub(crate) fn run_selection_screen(
         selected = available.clone();
     }
 
-    // 配置选择：默认 = None（Sherpa 内置端点），增强 = 加强版Zipformer-en
-    let has_any_online = MODEL_DESCS.iter().any(|d| matches!(d.kind, SlotKind::Online(_)));
-    let mut use_enhanced_config = false;
-    /// 配置面板固定行数（标题+border 各 1 行，内容 6 行）
-    const CONFIG_PANEL_LINES: u16 = 8;
-
     loop {
-        let config_panel_height = if has_any_online { CONFIG_PANEL_LINES } else { 0 };
         terminal.draw(|frame| {
             let area = frame.area();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
-                    Constraint::Min(6 + config_panel_height),
+                    Constraint::Min(6),
                     Constraint::Length(3),
                 ])
                 .split(area);
@@ -63,13 +55,6 @@ pub(crate) fn run_selection_screen(
             .block(Block::default().borders(Borders::ALL));
             frame.render_widget(title, chunks[0]);
 
-            // 中部：模型列表（上）+ 配置面板（下，仅当有流式模型时显示）
-            let body_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(6), Constraint::Length(config_panel_height)])
-                .split(chunks[1]);
-
-            // ── 模型列表 ──
             let mut lines: Vec<Line> = Vec::new();
             for (i, desc) in MODEL_DESCS.iter().enumerate() {
                 let ok = available[i];
@@ -85,11 +70,19 @@ pub(crate) fn run_selection_screen(
                     Language::English => "英文",
                 };
                 let kind_tag = match desc.kind {
-                    SlotKind::Online(_) => "流式",
+                    SlotKind::Online(_) => {
+                        if desc.is_enhanced() {
+                            "流式·增强"
+                        } else {
+                            "流式"
+                        }
+                    }
                     SlotKind::Offline(_) => "离线+VAD",
                 };
                 let style = if !ok {
                     Style::default().fg(Color::DarkGray)
+                } else if desc.is_enhanced() && selected[i] {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                 } else if selected[i] {
                     Style::default().fg(Color::Green)
                 } else {
@@ -104,6 +97,8 @@ pub(crate) fn run_selection_screen(
                     desc.missing_files_hint()
                         .map(|script| format!("  (未下载: {script})"))
                         .unwrap_or_default()
+                } else if desc.is_enhanced() {
+                    "  标点稳定700ms · VAD收尾300ms".to_string()
                 } else {
                     String::new()
                 };
@@ -117,69 +112,18 @@ pub(crate) fn run_selection_screen(
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                " 1-9 勾选模型 · e 切换切句配置 · Enter 确认 · q 退出 ",
+                " 1-9 勾选模型 · Enter 确认 · q 退出 ",
                 Style::default().fg(Color::DarkGray),
             )));
             let list = Paragraph::new(lines)
                 .block(Block::default().borders(Borders::ALL).title("选择引擎"));
-            frame.render_widget(list, body_chunks[0]);
-
-            // ── 配置面板 ──
-            if has_any_online {
-                let selected_style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
-                let unselected_style = Style::default().fg(Color::Gray);
-                let (default_style, enhanced_style) = if use_enhanced_config {
-                    (unselected_style, selected_style)
-                } else {
-                    (selected_style, unselected_style)
-                };
-                let (default_mark, enhanced_mark) = if use_enhanced_config {
-                    ("[ ]", "[x]")
-                } else {
-                    ("[x]", "[ ]")
-                };
-                let config_lines = vec![
-                    Line::from(vec![
-                        Span::styled(
-                            format!(" {default_mark} 默认（Sherpa 内置端点）"),
-                            default_style,
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            format!(" {enhanced_mark} 加强版Zipformer-en"),
-                            enhanced_style,
-                        ),
-                    ]),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        if use_enhanced_config {
-                            "    标点稳定700ms · 冷却1.5s · 兜底10s · 强切25s · VAD收尾300ms"
-                        } else {
-                            "    Sherpa rule1=2.4s rule2=1.2s rule3=20s"
-                        },
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                    Line::from(Span::styled(
-                        "    按 e 切换（仅对流式模型 Zipformer/Nemotron 生效）",
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                ];
-                let config_para = Paragraph::new(config_lines)
-                    .block(Block::default().borders(Borders::ALL).title(" 切句配置 "));
-                frame.render_widget(config_para, body_chunks[1]);
-            }
+            frame.render_widget(list, chunks[1]);
 
             let count = selected.iter().filter(|&&s| s).count();
-            let config_tag = if use_enhanced_config && has_any_online {
-                " · 加强版Zipformer-en"
-            } else {
-                ""
-            };
             let hint = if count == 0 {
                 " 请至少选择一个引擎".to_string()
             } else {
-                format!(" 将加载 {count} 个引擎{config_tag}（模型较大，加载需几秒）")
+                format!(" 将加载 {count} 个引擎（模型较大，加载需几秒）")
             };
             let hint_style = if count == 0 {
                 Style::default().fg(Color::Red)
@@ -195,9 +139,6 @@ pub(crate) fn run_selection_screen(
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
-                    KeyCode::Char('e') if has_any_online => {
-                        use_enhanced_config = !use_enhanced_config;
-                    }
                     KeyCode::Char(c @ '1'..='9') => {
                         let idx = (c as u8 - b'1') as usize;
                         if idx < selected.len() && available[idx] {
@@ -212,12 +153,7 @@ pub(crate) fn run_selection_screen(
                             .map(|(i, _)| i)
                             .collect();
                         if !indices.is_empty() {
-                            let config = if use_enhanced_config {
-                                Some(SEG_CONFIG_ENHANCED_ZIPFORMER_EN.clone())
-                            } else {
-                                None
-                            };
-                            return Ok(Some((indices, config)));
+                            return Ok(Some(indices));
                         }
                     }
                     _ => {}

@@ -52,6 +52,12 @@ pub(crate) struct ModelDesc {
 }
 
 impl ModelDesc {
+    /// 是否为"加强版"模型（名称含"加强版"）。
+    /// 用于自动注入标点切句配置，避免在多处重复字符串匹配。
+    pub(crate) fn is_enhanced(&self) -> bool {
+        self.name.contains("加强版")
+    }
+
     /// 离线模型要求目录存在且文件齐全；不齐全时返回 false，调用方据此从选择屏过滤。
     /// 流式模型（Online）一律返回 true（缺文件会在 build_slot 阶段报错，那是另一条路径）。
     pub(crate) fn files_present(&self) -> bool {
@@ -85,6 +91,12 @@ pub(crate) const MODEL_DESCS: &[ModelDesc] = &[
     ModelDesc {
         name: "Zipformer-en",
         subdir: "zipformer-en",
+        kind: SlotKind::Online(SherpaModelType::Zipformer),
+        language: Language::English,
+    },
+    ModelDesc {
+        name: "Zipformer-en (加强版)",
+        subdir: "zipformer-en-enhanced",
         kind: SlotKind::Online(SherpaModelType::Zipformer),
         language: Language::English,
     },

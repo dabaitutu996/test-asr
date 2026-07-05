@@ -53,8 +53,9 @@ use crate::config::POLL_INTERVAL;
 use crate::engine::{decode_offline_segment, feed_online_frame, AnySlot};
 use crate::media::MediaState;
 use crate::models::MODEL_DESCS;
+use crate::segments::SEG_CONFIG_ENHANCED_ZIPFORMER_EN;
 use crate::ui::{draw, run_device_screen, run_preview_screen, run_selection_screen};
-use crate::util::{humantime_elapsed, push_log, rms};
+use crate::util::{humantime_elapsed, push_log, rms, StderrSuppressGuard};
 use crate::vad::VadState;
 
 fn main() -> Result<()> {
@@ -73,9 +74,9 @@ fn main() -> Result<()> {
         prev_hook(info);
     }));
 
-    // 阶段 1：选择引擎 + 切句配置。
-    let (indices, seg_config) = match run_selection_screen(&mut terminal)? {
-        Some((idx, cfg)) => (idx, cfg),
+    // 阶段 1：选择引擎。
+    let indices = match run_selection_screen(&mut terminal)? {
+        Some(i) => i,
         None => {
             disable_raw_mode()?;
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -85,12 +86,11 @@ fn main() -> Result<()> {
         }
     };
 
-    // 阶段 2：加载选中的模型。
+    // 阶段 2：加载选中的模型。"加强版"模型自动注入切句配置。
     terminal.draw(|frame| {
         let area = frame.area();
         let names: Vec<&str> = indices.iter().map(|&i| MODEL_DESCS[i].name).collect();
-        let cfg_tag = if seg_config.is_some() { " · 加强版" } else { "" };
-        let msg = format!(" 正在加载: {} ... {cfg_tag}", names.join(", "));
+        let msg = format!(" 正在加载: {} ... ", names.join(", "));
         let loading = Paragraph::new(Line::from(Span::styled(
             msg,
             Style::default()
@@ -103,13 +103,14 @@ fn main() -> Result<()> {
 
     let mut slots = Vec::with_capacity(indices.len());
     for &i in &indices {
-        // 只有流式模型（且选了加强配置的）才传 seg_config
-        let model_config = if matches!(MODEL_DESCS[i].kind, crate::models::SlotKind::Online(_)) {
-            seg_config.as_ref()
+        let desc = &MODEL_DESCS[i];
+        // "加强版"模型自动注入 B 推荐配置
+        let seg_config = if desc.is_enhanced() {
+            Some(&SEG_CONFIG_ENHANCED_ZIPFORMER_EN)
         } else {
             None
         };
-        slots.push(AnySlot::build_with_config(&MODEL_DESCS[i], model_config)?);
+        slots.push(AnySlot::build_with_config(desc, seg_config)?);
     }
     let has_offline_slots = slots.iter().any(|slot| !slot.is_online());
     let vad = VadState::new(has_offline_slots)?;
@@ -194,11 +195,15 @@ fn run_loop(
     app: &mut App,
     capture: &mut Capture,
 ) -> Result<()> {
+    // 主循环期间持久屏蔽 stderr（Sherpa/ONNX Runtime 可能从后台线程打印 C++ 日志）。
+    // stdout 保持原样，因为 crossterm TUI 渲染需要它。
+    let _stderr_guard = StderrSuppressGuard::new();
+
     loop {
         while let Ok(frame) = capture.rx.try_recv() {
             app.last_rms = rms(&frame);
 
-            // 1) 流式槽：增量喂当前帧（沿用原有 feed 逻辑）。
+            // 1) 流式槽：增量喂当前帧。
             for slot in &mut app.slots {
                 if let AnySlot::Online(s) = slot {
                     if let Some(final_text) = feed_online_frame(s, &frame) {
