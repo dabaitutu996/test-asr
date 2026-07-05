@@ -47,6 +47,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 
 use crate::app::App;
+use crate::capture::{Capture, DevicePick};
 use crate::config::POLL_INTERVAL;
 use crate::engine::{decode_offline_segment, feed_online_frame, AnySlot};
 use crate::media::MediaState;
@@ -106,7 +107,7 @@ fn main() -> Result<()> {
     let vad = VadState::new(has_offline_slots)?;
 
     // 阶段 3 + 4：设备选择 → 预览。两屏之间可往返（预览 Esc 回设备选择）。
-    let (mut rx, source_label) = loop {
+    let (device_pick, mut capture, source_label) = loop {
         let (pick, inputs, outputs) = match run_device_screen(&mut terminal)? {
             Some(v) => v,
             None => {
@@ -121,11 +122,12 @@ fn main() -> Result<()> {
         match run_preview_screen(&mut terminal, &pick, &inputs, &outputs)? {
             Some(capture) => {
                 let label = pick.label(&inputs, &outputs);
-                break (capture.rx, label);
+                break (pick, capture, label);
             }
             None => continue, // Esc：回设备选择屏重选
         }
     };
+    let sample_file_mode = matches!(device_pick, DevicePick::SampleFile(_));
 
     let media = MediaState::load_default()?;
     let mut app = App {
@@ -137,23 +139,37 @@ fn main() -> Result<()> {
         source_label,
         active_slot: 0,
         media,
+        sample_file_mode,
     };
     if let Some(media) = &mut app.media {
-        match media.start() {
-            Ok(()) => app.log.push(format!(
-                "已开始播放: {}",
-                media
-                    .audio_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            )),
+        let start_result = if capture.is_sample_file() {
+            media.start_clock_only();
+            Ok(())
+        } else {
+            media.start()
+        };
+        match start_result {
+            Ok(()) => {
+                let action = if capture.is_sample_file() {
+                    "已开始示例文件回放"
+                } else {
+                    "已开始播放"
+                };
+                app.log.push(format!(
+                    "{action}: {}",
+                    media
+                        .audio_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ));
+            }
             Err(e) => app.log.push(format!("音频播放启动失败: {e:#}")),
         }
     }
 
     // 阶段 5：主 TUI 循环。
-    let result = run_loop(&mut terminal, &mut app, &mut rx);
+    let result = run_loop(&mut terminal, &mut app, &mut capture);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -168,10 +184,10 @@ fn main() -> Result<()> {
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    rx: &mut tokio::sync::mpsc::Receiver<Vec<f32>>,
+    capture: &mut Capture,
 ) -> Result<()> {
     loop {
-        while let Ok(frame) = rx.try_recv() {
+        while let Ok(frame) = capture.rx.try_recv() {
             app.last_rms = rms(&frame);
 
             // 1) 流式槽：增量喂当前帧（沿用原有 feed 逻辑）。
@@ -203,7 +219,7 @@ fn run_loop(
                 if matches!(key.code, KeyCode::Char('c')) {
                     app.clear();
                 }
-                app.handle_media_key(&key);
+                app.handle_media_key(&key, capture);
                 match key.code {
                     KeyCode::Left => app.move_active_slot(-1),
                     KeyCode::Right => app.move_active_slot(1),
@@ -222,6 +238,15 @@ fn run_loop(
         }
 
         app.refresh_media();
+
+        // 样本文件自然播完后，同步暂停 media 时钟（否则时钟继续走秒）。
+        if let Some(media) = &mut app.media {
+            if capture.is_sample_file() && media.playing && !capture.is_sample_file_playing() {
+                media.pause_clock();
+                push_log(&mut app.log, "示例文件播放完毕");
+            }
+        }
+
         terminal.draw(|frame| draw(app, frame))?;
     }
 }

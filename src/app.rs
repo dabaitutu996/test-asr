@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 
+use crate::capture::Capture;
 use crate::engine::{AnySlot, SlotView};
 use crate::media::MediaState;
 use crate::report::export_report;
@@ -20,6 +21,7 @@ pub(crate) struct App {
     pub(crate) source_label: String,
     pub(crate) active_slot: usize,
     pub(crate) media: Option<MediaState>,
+    pub(crate) sample_file_mode: bool,
 }
 
 impl App {
@@ -80,19 +82,32 @@ impl App {
 
     /// 处理媒体相关按键。所有失败都记入日志而非上抛——播放/导出出错
     /// 不应掀翻整个 TUI（与主循环启动播放时的 catch+log 策略一致）。
-    pub(crate) fn handle_media_key(&mut self, key: &KeyEvent) {
+    pub(crate) fn handle_media_key(&mut self, key: &KeyEvent, capture: &mut Capture) {
         match key.code {
             KeyCode::Char(' ') => {
-                if let Some(media) = &mut self.media {
+                if capture.is_sample_file() {
+                    match capture.toggle_sample_file_playback() {
+                        Some(playing) => {
+                            if let Some(media) = &mut self.media {
+                                if playing {
+                                    media.resume_clock();
+                                } else {
+                                    media.pause_clock();
+                                }
+                            }
+                        }
+                        None => push_log(&mut self.log, "示例文件暂停失败"),
+                    }
+                } else if let Some(media) = &mut self.media {
                     if let Err(e) = media.toggle_play() {
                         push_log(&mut self.log, format!("播放切换失败: {e:#}"));
                     }
                 }
             }
-            KeyCode::Char('h') => self.media_seek(-10_000),
-            KeyCode::Char('l') => self.media_seek(10_000),
-            KeyCode::Char('H') => self.media_seek(-60_000),
-            KeyCode::Char('L') => self.media_seek(60_000),
+            KeyCode::Char('h') => self.media_seek(-10_000, capture),
+            KeyCode::Char('l') => self.media_seek(10_000, capture),
+            KeyCode::Char('H') => self.media_seek(-60_000, capture),
+            KeyCode::Char('L') => self.media_seek(60_000, capture),
             KeyCode::Char('e') => match export_report(self) {
                 Ok(path) => {
                     if let Some(media) = &mut self.media {
@@ -106,8 +121,17 @@ impl App {
         }
     }
 
-    fn media_seek(&mut self, delta_ms: i64) {
-        if let Some(media) = &mut self.media {
+    fn media_seek(&mut self, delta_ms: i64, capture: &mut Capture) {
+        if capture.is_sample_file() {
+            match capture.seek_sample_file_by(delta_ms) {
+                Some(position_ms) => {
+                    if let Some(media) = &mut self.media {
+                        media.set_position_ms(position_ms);
+                    }
+                }
+                None => push_log(&mut self.log, "示例文件跳转失败"),
+            }
+        } else if let Some(media) = &mut self.media {
             if let Err(e) = media.seek_by(delta_ms) {
                 push_log(&mut self.log, format!("跳转失败: {e:#}"));
             }

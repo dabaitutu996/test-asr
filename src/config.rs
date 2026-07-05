@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// 顶部 partial 之外，每个 slot 最多保留多少条 final 历史。
-pub(crate) const FINALS_RETAIN: usize = 6;
+/// 每个槽最多保留多少条 final 结果用于显示（保留最近 N 条供滚动回溯）。
+pub(crate) const FINALS_RETAIN: usize = 500;
 /// 每个在线槽最多记录多少条 partial 变化，用于诊断 endpoint/reset 是否丢词。
 pub(crate) const PARTIAL_HISTORY_RETAIN: usize = 2000;
 /// TUI 轮询周期：终端事件与重绘节奏。

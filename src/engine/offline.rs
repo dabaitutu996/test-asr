@@ -124,9 +124,9 @@ pub(crate) fn decode_offline_segment(
         return None;
     }
     slot.finals.push(text.clone());
-    slot.all_finals.push(text.clone());
     if slot.finals.len() > FINALS_RETAIN {
         slot.finals.remove(0);
     }
+    slot.all_finals.push(text.clone());
     Some(text)
 }

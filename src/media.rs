@@ -55,11 +55,14 @@ impl MediaState {
 
     pub(crate) fn start(&mut self) -> Result<()> {
         self.stop_child();
-        self.anchor_ms = self.position_ms;
-        self.anchor_started_at = Instant::now();
-        self.playing = true;
         self.child = Some(spawn_ffplay(&self.audio_path, self.position_ms)?);
+        self.resume_clock();
         Ok(())
+    }
+
+    pub(crate) fn start_clock_only(&mut self) {
+        self.stop_child();
+        self.resume_clock();
     }
 
     fn stop_child(&mut self) {
@@ -70,9 +73,7 @@ impl MediaState {
     }
 
     fn pause(&mut self) {
-        self.refresh_position();
-        self.playing = false;
-        self.stop_child();
+        self.pause_clock();
     }
 
     pub(crate) fn toggle_play(&mut self) -> Result<()> {
@@ -90,16 +91,36 @@ impl MediaState {
         }
     }
 
+    pub(crate) fn pause_clock(&mut self) {
+        self.refresh_position();
+        self.playing = false;
+        self.stop_child();
+    }
+
+    pub(crate) fn resume_clock(&mut self) {
+        self.anchor_ms = self.position_ms;
+        self.anchor_started_at = Instant::now();
+        self.playing = true;
+    }
+
+    pub(crate) fn set_position_ms(&mut self, position_ms: u64) {
+        self.position_ms = if self.duration_ms > 0 {
+            position_ms.min(self.duration_ms)
+        } else {
+            position_ms
+        };
+        self.anchor_ms = self.position_ms;
+        self.anchor_started_at = Instant::now();
+    }
+
     pub(crate) fn seek_by(&mut self, delta_ms: i64) -> Result<()> {
         self.refresh_position();
-        self.position_ms = if delta_ms.is_negative() {
+        let next_position = if delta_ms.is_negative() {
             self.position_ms.saturating_sub(delta_ms.unsigned_abs())
         } else {
             self.position_ms.saturating_add(delta_ms as u64)
         };
-        if self.duration_ms > 0 {
-            self.position_ms = self.position_ms.min(self.duration_ms);
-        }
+        self.set_position_ms(next_position);
         if self.playing {
             self.start()?;
         }

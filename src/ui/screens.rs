@@ -15,7 +15,7 @@ use ratatui::Terminal;
 use arcvoice_core::asr::Language;
 use asr_compare_tui::system_audio::OutputDevice;
 
-use crate::capture::{list_inputs, list_outputs, Capture, DevicePick};
+use crate::capture::{list_inputs, list_outputs, list_sample_files, Capture, DevicePick};
 use crate::models::{SlotKind, MODEL_DESCS};
 use crate::util::rms;
 
@@ -163,15 +163,18 @@ pub(crate) fn run_device_screen(
     // 进入时一次性枚举。失败用空列表，UI 会显示「无可用设备」。
     let inputs = list_inputs();
     let outputs = list_outputs();
+    let sample_files = list_sample_files();
 
     // 扁平游标：把 (区, 索引) 视为一个一维序列。
-    // region: 0=输入区，1=输出区。
-    let total = inputs.len() + outputs.len();
+    // region: 0=输入区，1=输出区，2=示例文件区。
+    let total = inputs.len() + outputs.len() + sample_files.len();
     let mut cursor: usize = 0;
 
     // 初始光标落在第一个非空区的第一项，避免停在空区。
     if inputs.is_empty() && !outputs.is_empty() {
         cursor = inputs.len(); // 跳到输出区第一项
+    } else if inputs.is_empty() && outputs.is_empty() && !sample_files.is_empty() {
+        cursor = inputs.len() + outputs.len(); // 跳到示例文件第一项
     }
 
     loop {
@@ -196,11 +199,13 @@ pub(crate) fn run_device_screen(
             // 上下两区按内容高度分配。中间区域竖直拆分。
             let input_h = (inputs.len() + 2).max(3) as u16;
             let output_h = (outputs.len() + 2).max(3) as u16;
+            let sample_h = (sample_files.len() + 2).max(3) as u16;
             let body = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(input_h as u16),
-                    Constraint::Min(output_h as u16),
+                    Constraint::Length(output_h as u16),
+                    Constraint::Min(sample_h as u16),
                 ])
                 .split(chunks[1]);
 
@@ -266,9 +271,45 @@ pub(crate) fn run_device_screen(
             );
             frame.render_widget(out_para, body[1]);
 
+            // 示例文件区
+            let mut sample_lines: Vec<Line> = Vec::new();
+            if sample_files.is_empty() {
+                sample_lines.push(Line::from(Span::styled(
+                    " （未找到默认示例 mp3）",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            for (i, path) in sample_files.iter().enumerate() {
+                let flat = inputs.len() + outputs.len() + i;
+                let mark = if flat == cursor { "▸" } else { " " };
+                let style = if flat == cursor {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("<unknown>");
+                sample_lines.push(Line::from(vec![
+                    Span::raw(format!(" {mark} ")),
+                    Span::styled(format!("[F{}] ", i + 1), Style::default().fg(Color::Cyan)),
+                    Span::styled(name.to_string(), style),
+                    Span::styled("  直接送入 ASR", Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            let sample_para = Paragraph::new(sample_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" 示例音频文件（绕过系统音频采集） "),
+            );
+            frame.render_widget(sample_para, body[2]);
+
             let hint = if total == 0 {
                 Span::styled(
-                    " 无可用设备，请检查麦克风/扬声器 · q 返回",
+                    " 无可用采集源，请检查麦克风/扬声器或默认 mp3 · q 返回",
                     Style::default().fg(Color::Red),
                 )
             } else {
@@ -304,11 +345,18 @@ pub(crate) fn run_device_screen(
                                 inputs.clone(),
                                 outputs.clone(),
                             )));
-                        } else if cursor < total {
+                        } else if cursor < inputs.len() + outputs.len() {
                             let dev = &outputs[cursor - inputs.len()];
                             let uid = dev.uid.clone();
                             return Ok(Some((
                                 DevicePick::Output(uid),
+                                inputs.clone(),
+                                outputs.clone(),
+                            )));
+                        } else if cursor < total {
+                            let path = sample_files[cursor - inputs.len() - outputs.len()].clone();
+                            return Ok(Some((
+                                DevicePick::SampleFile(path),
                                 inputs.clone(),
                                 outputs.clone(),
                             )));
@@ -373,10 +421,7 @@ pub(crate) fn run_preview_screen(
                     Span::raw(label.clone()),
                 ]),
                 Line::from(""),
-                Line::from(Span::styled(
-                    " 对着麦克风说话 / 播放声音，观察下方电平是否跳动",
-                    Style::default().fg(Color::DarkGray),
-                )),
+                Line::from(Span::styled(preview_hint_for_pick(pick), Style::default().fg(Color::DarkGray))),
             ];
             if show_output_tcc_hint {
                 info_lines.push(Line::from(""));
@@ -419,11 +464,30 @@ pub(crate) fn run_preview_screen(
                         return Ok(None);
                     }
                     KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
+                        if matches!(pick, DevicePick::SampleFile(_)) {
+                            capture.stop();
+                            return match Capture::start(pick) {
+                                Ok(fresh_capture) => Ok(Some(fresh_capture)),
+                                Err(e) => {
+                                    show_error_screen(terminal, &label, &format!("{e:#}"))?;
+                                    Ok(None)
+                                }
+                            };
+                        }
                         return Ok(Some(capture));
                     }
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+fn preview_hint_for_pick(pick: &DevicePick) -> &'static str {
+    match pick {
+        DevicePick::SampleFile(_) => " 正在把示例 mp3 解码为 16kHz mono PCM，并按实时速度送入 ASR",
+        DevicePick::Input(_) | DevicePick::Output(_) => {
+            " 对着麦克风说话 / 播放声音，观察下方电平是否跳动"
         }
     }
 }

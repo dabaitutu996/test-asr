@@ -50,7 +50,7 @@ pub(crate) fn draw(app: &App, frame: &mut ratatui::Frame) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
             .split(chunks[1]);
-        render_media_panel(media, frame, body[0]);
+        render_media_panel(media, frame, body[0], app.sample_file_mode);
         body[1]
     } else {
         chunks[1]
@@ -115,8 +115,11 @@ pub(crate) fn draw(app: &App, frame: &mut ratatui::Frame) {
         frame.render_widget(partial_para, col_layout[0]);
 
         let mut finals_lines: Vec<Line> = Vec::new();
-        for f in slot.finals() {
-            finals_lines.push(Line::from(Span::styled(format!("· {f}"), text_style)));
+        for (idx, f) in slot.finals().iter().enumerate() {
+            if idx > 0 {
+                finals_lines.push(Line::from(""));
+            }
+            finals_lines.push(Line::from(Span::styled(f.clone(), text_style)));
         }
         if finals_lines.is_empty() {
             finals_lines.push(Line::from(Span::styled(
@@ -151,9 +154,18 @@ pub(crate) fn draw(app: &App, frame: &mut ratatui::Frame) {
     frame.render_widget(log_para, chunks[2]);
 }
 
-fn render_media_panel(media: &MediaState, frame: &mut ratatui::Frame, area: Rect) {
+fn render_media_panel(
+    media: &MediaState,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    sample_file_mode: bool,
+) {
     let active = media.active_index();
-    let title = if media.playing {
+    let title = if sample_file_mode && media.playing {
+        " subtitles / sample file running "
+    } else if sample_file_mode {
+        " subtitles / sample file paused "
+    } else if media.playing {
         " subtitles playing "
     } else {
         " subtitles paused "
@@ -176,7 +188,11 @@ fn render_media_panel(media: &MediaState, frame: &mut ratatui::Frame, area: Rect
         )),
         Line::from(vec![
             Span::styled("seek: ", Style::default().fg(Color::Cyan)),
-            Span::raw("h/l 10s · H/L 60s · space pause · e report"),
+            Span::raw(if sample_file_mode {
+                "h/l 10s · H/L 60s · space pause sample input · e report"
+            } else {
+                "h/l 10s · H/L 60s · space pause audio · e report"
+            }),
         ]),
         Line::from(""),
     ];

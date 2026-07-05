@@ -126,10 +126,10 @@ pub(crate) fn feed_online_frame(slot: &mut OnlineSlot, pcm: &[f32]) -> Option<St
         slot.partial.clear();
         if !final_text.trim().is_empty() {
             slot.finals.push(final_text.clone());
-            slot.all_finals.push(final_text.clone());
             if slot.finals.len() > FINALS_RETAIN {
                 slot.finals.remove(0);
             }
+            slot.all_finals.push(final_text.clone());
             return Some(final_text);
         }
     }
