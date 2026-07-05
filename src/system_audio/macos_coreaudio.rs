@@ -100,8 +100,7 @@ struct TapCallbackState {
     channels: usize,
     format_flags: u32,
     bytes_per_frame: u32,
-    #[allow(dead_code)]
-    frames_per_packet: u32,
+    _frames_per_packet: u32,
     bits_per_channel: u32,
     layout_logged: AtomicBool,
     watchdog: SilenceWatchdog,
@@ -158,7 +157,7 @@ pub(super) unsafe fn create_tap_objects(
         channels,
         format_flags: format.mFormatFlags,
         bytes_per_frame: format.mBytesPerFrame,
-        frames_per_packet: format.mFramesPerPacket,
+        _frames_per_packet: format.mFramesPerPacket,
         bits_per_channel: format.mBitsPerChannel,
         layout_logged: AtomicBool::new(false),
         watchdog: SilenceWatchdog::new(TAP_REBUILD_SILENCE_MS),
