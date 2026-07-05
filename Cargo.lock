@@ -93,6 +93,7 @@ dependencies = [
  "crossterm",
  "hound",
  "ratatui",
+ "sherpa-onnx",
  "tokio",
  "tracing",
  "tracing-subscriber",

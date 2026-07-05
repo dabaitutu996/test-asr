@@ -8,14 +8,16 @@
 
 #![cfg(not(target_os = "windows"))]
 
+use std::fs;
 use std::io;
 use std::os::unix::io::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -23,11 +25,12 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
+use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 use tokio::sync::mpsc;
 
 use arcvoice_core::asr::streaming::{
@@ -39,8 +42,22 @@ use arcvoice_core::audio::system_audio::{self, OutputDevice};
 
 /// 顶部 partial 之外，每个 slot 最多保留多少条 final 历史。
 const FINALS_RETAIN: usize = 6;
+/// 每个在线槽最多记录多少条 partial 变化，用于诊断 endpoint/reset 是否丢词。
+const PARTIAL_HISTORY_RETAIN: usize = 2000;
 /// TUI 轮询周期：终端事件与重绘节奏。
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DEFAULT_MEDIA_MP3: &str = "ARC_Raiders_is_getting_DARKER....mp3";
+const DEFAULT_MEDIA_SRT: &str = "ARC_Raiders_is_getting_DARKER....en.srt";
+
+// ─── 离线模型 VAD 参数 ─────────────────────────────────────────────────
+/// RMS 低于此值视为静音（BlackHole 系统音频在无声段约 0.001-0.005；
+/// 解说语音通常 > 0.02）。可通过环境变量 VAD_RMS_THRESHOLD 覆盖。
+const VAD_RMS_THRESHOLD: f32 = 0.012;
+/// 静音持续多少秒后触发离线解码（句尾判定）。
+const VAD_SILENCE_SEC: f32 = 0.4;
+/// 缓冲最长多少秒强制触发解码（避免超长段 Canary 扛不住，也防止
+/// 游戏背景音乐持续高于阈值导致一直"说话态"不触发）。
+const VAD_MAX_BUFFER_SEC: f32 = 8.0;
 
 // ─── 工具函数 ──────────────────────────────────────────────────────────
 
@@ -94,77 +111,178 @@ fn engine_models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../game-video/engine/models/streaming")
 }
 
+/// 离线模型（Canary 等）目录：本项目下的 models/streaming/。
+/// 与流式模型分开存放——流式模型沿用 sibling game-video 仓库，
+/// 离线模型体积大、独立性强，放本仓库更清晰。
+fn offline_models_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("OFFLINE_MODELS_DIR") {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/streaming")
+}
+
 // ─── 模型静态描述 ─────────────────────────────────────────────────────
+
+/// 区分流式（OnlineRecognizer，真流式 transducer）和离线（OfflineRecognizer，
+/// 需要外部 VAD 触发解码）两类后端。
+#[derive(Clone, Copy, PartialEq)]
+enum SlotKind {
+    /// sherpa-onnx OnlineRecognizer：Zipformer / Nemotron 等真流式 transducer。
+    Online(SherpaModelType),
+    /// sherpa-onnx OfflineRecognizer：Canary-180m-flash（离线 + VAD 触发）。
+    OfflineCanary,
+}
 
 struct ModelDesc {
     name: &'static str,
     subdir: &'static str,
-    model_type: SherpaModelType,
+    kind: SlotKind,
     language: Language,
+}
+
+impl ModelDesc {
+    /// 离线模型要求目录存在且文件齐全；不齐全时返回 false，调用方据此从选择屏过滤。
+    /// 流式模型（Online）一律返回 true（缺文件会在 build_slot 阶段报错，那是另一条路径）。
+    fn files_present(&self) -> bool {
+        match self.kind {
+            SlotKind::Online(_) => true,
+            SlotKind::OfflineCanary => {
+                let dir = offline_models_dir().join(self.subdir);
+                dir.join("encoder.int8.onnx").exists()
+                    && dir.join("decoder.int8.onnx").exists()
+                    && dir.join("tokens.txt").exists()
+            }
+        }
+    }
 }
 
 const MODEL_DESCS: &[ModelDesc] = &[
     ModelDesc {
         name: "Zipformer-zh",
         subdir: "zipformer-zh",
-        model_type: SherpaModelType::Zipformer,
+        kind: SlotKind::Online(SherpaModelType::Zipformer),
         language: Language::Chinese,
     },
     ModelDesc {
         name: "Zipformer-en",
         subdir: "zipformer-en",
-        model_type: SherpaModelType::Zipformer,
+        kind: SlotKind::Online(SherpaModelType::Zipformer),
         language: Language::English,
     },
     ModelDesc {
         name: "Nemotron-en",
         subdir: "nemotron-en",
-        model_type: SherpaModelType::NemotronStreaming,
+        kind: SlotKind::Online(SherpaModelType::NemotronStreaming),
+        language: Language::English,
+    },
+    ModelDesc {
+        name: "Canary-180m-flash",
+        subdir: "canary-180m-flash",
+        kind: SlotKind::OfflineCanary,
         language: Language::English,
     },
 ];
 
+fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f32>().ok())
+        .unwrap_or(default)
+}
+
+fn endpoint_rules_from_env() -> (f32, f32, f32) {
+    (
+        env_f32("ASR_ENDPOINT_RULE1", 2.4),
+        env_f32("ASR_ENDPOINT_RULE2", 1.2),
+        env_f32("ASR_ENDPOINT_RULE3", 20.0),
+    )
+}
+
+fn hotwords_from_env() -> Vec<String> {
+    std::env::var("ASR_HOTWORDS")
+        .ok()
+        .map(|raw| {
+            raw.split([',', '\n'])
+                .map(str::trim)
+                .filter(|word| !word.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ─── 运行态 ───────────────────────────────────────────────────────────
 
-struct ModelSlot {
+// ─── 流式槽（OnlineRecognizer：Zipformer / Nemotron）──────────────────
+
+struct OnlineSlot {
     name: &'static str,
     #[allow(dead_code)]
     engine: SherpaOnlineAsrEngine,
     stream: Box<dyn OnlineAsrStream>,
     partial: String,
+    all_partials: Vec<String>,
     finals: Vec<String>,
+    all_finals: Vec<String>,
     enabled: bool,
+    finals_scroll: u16,
 }
 
-fn build_slot(desc: &ModelDesc) -> Result<ModelSlot> {
+fn build_online_slot(desc: &ModelDesc) -> Result<OnlineSlot> {
     let model_dir = engine_models_dir().join(desc.subdir);
-    let cfg = SherpaConfig::new(model_dir.clone(), desc.model_type, desc.language);
+    let model_type = match desc.kind {
+        SlotKind::Online(mt) => mt,
+        SlotKind::OfflineCanary => bail!("build_online_slot 收到 OfflineCanary"),
+    };
+    let (rule1, rule2, rule3) = endpoint_rules_from_env();
+    let mut cfg = SherpaConfig::new(model_dir.clone(), model_type, desc.language)
+        .with_endpoint_rules(rule1, rule2, rule3);
+    if matches!(model_type, SherpaModelType::Zipformer) {
+        cfg = cfg.with_hotwords(hotwords_from_env());
+    }
     let engine = with_stdout_suppressed(|| SherpaOnlineAsrEngine::load(cfg))
         .with_context(|| format!("加载模型 {} 失败，目录 {:?} 是否存在", desc.name, model_dir))?;
     let mut stream = engine.create_stream()?;
     stream.prepare();
-    Ok(ModelSlot {
+    Ok(OnlineSlot {
         name: desc.name,
         engine,
         stream,
         partial: String::new(),
+        all_partials: Vec::new(),
         finals: Vec::new(),
+        all_finals: Vec::new(),
         enabled: true,
+        finals_scroll: 0,
     })
 }
 
-fn feed_frame(slot: &mut ModelSlot, pcm: &[f32]) -> Option<String> {
+fn feed_online_frame(slot: &mut OnlineSlot, pcm: &[f32]) -> Option<String> {
     if !slot.enabled {
         return None;
     }
     slot.stream.accept_waveform(pcm);
     slot.stream.decode();
-    slot.partial = slot.stream.current_partial();
+    let next_partial = slot.stream.current_partial();
+    let trimmed_partial = next_partial.trim();
+    if !trimmed_partial.is_empty()
+        && slot
+            .all_partials
+            .last()
+            .is_none_or(|last| last.trim() != trimmed_partial)
+    {
+        slot.all_partials.push(trimmed_partial.to_string());
+        if slot.all_partials.len() > PARTIAL_HISTORY_RETAIN {
+            slot.all_partials.remove(0);
+        }
+    }
+    slot.partial = next_partial;
     if slot.stream.is_endpoint() {
         let final_text = slot.stream.take_final();
         slot.partial.clear();
         if !final_text.trim().is_empty() {
             slot.finals.push(final_text.clone());
+            slot.all_finals.push(final_text.clone());
             if slot.finals.len() > FINALS_RETAIN {
                 slot.finals.remove(0);
             }
@@ -172,6 +290,349 @@ fn feed_frame(slot: &mut ModelSlot, pcm: &[f32]) -> Option<String> {
         }
     }
     None
+}
+
+// ─── 离线槽（OfflineRecognizer：Canary-180m-flash）────────────────────
+//
+// Canary 是离线模型，没有 partial / endpoint 概念。靠外部 VAD 判定句尾，
+// 把累积的音频片段一次性 decode，结果当作 final。
+//
+// 设计：每个离线槽持有一个 OfflineRecognizer，但 VAD 状态由外部 AnySlot 容器
+// 统一管理（VadState），保证多个离线槽收到完全相同的音频片段（公平对比）。
+
+struct OfflineCanarySlot {
+    name: &'static str,
+    #[allow(dead_code)]
+    recognizer: OfflineRecognizer,
+    partial: String, // 离线模型恒为空，UI 显示"等待 VAD 触发"
+    finals: Vec<String>,
+    all_finals: Vec<String>,
+    enabled: bool,
+    finals_scroll: u16,
+    /// 正在等待解码：累积到的片段长度（用于报告统计）。
+    pending_samples: usize,
+}
+
+fn build_canary_slot(desc: &ModelDesc) -> Result<OfflineCanarySlot> {
+    let dir = offline_models_dir().join(desc.subdir);
+    let encoder = dir.join("encoder.int8.onnx");
+    let decoder = dir.join("decoder.int8.onnx");
+    let tokens = dir.join("tokens.txt");
+    for (label, path) in [
+        ("encoder", &encoder),
+        ("decoder", &decoder),
+        ("tokens", &tokens),
+    ] {
+        if !path.exists() {
+            bail!(
+                "Canary 模型文件缺失: {} ({})\n\
+                 请先运行 ./scripts/download-canary.sh 下载。",
+                label,
+                path.display()
+            );
+        }
+    }
+
+    let mut cfg = OfflineRecognizerConfig::default();
+    // Canary 用 128 维 mel filterbank（sherpa-onnx 默认 80，必须显式设置）
+    cfg.feat_config.feature_dim = 128;
+    cfg.model_config.canary.encoder = Some(encoder.to_string_lossy().into_owned());
+    cfg.model_config.canary.decoder = Some(decoder.to_string_lossy().into_owned());
+    cfg.model_config.canary.src_lang = Some("en".into());
+    cfg.model_config.canary.tgt_lang = Some("en".into());
+    cfg.model_config.canary.use_pnc = true; // 标点 + 大小写
+    cfg.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
+    cfg.model_config.num_threads = 1;
+    cfg.model_config.provider = Some("cpu".into());
+    cfg.model_config.debug = false;
+
+    let recognizer = with_stdout_suppressed(|| {
+        OfflineRecognizer::create(&cfg).context("创建 Canary OfflineRecognizer 失败")
+    })?;
+
+    Ok(OfflineCanarySlot {
+        name: desc.name,
+        recognizer,
+        partial: String::new(),
+        finals: Vec::new(),
+        all_finals: Vec::new(),
+        enabled: true,
+        finals_scroll: 0,
+        pending_samples: 0,
+    })
+}
+
+/// 把一段已经 VAD 切好的音频喂给 Canary 解码，返回识别文本（带标点）。
+fn decode_canary_segment(slot: &mut OfflineCanarySlot, pcm: &[f32]) -> Option<String> {
+    if !slot.enabled || pcm.is_empty() {
+        slot.pending_samples = 0;
+        return None;
+    }
+    slot.pending_samples = 0;
+
+    let stream = slot.recognizer.create_stream();
+    stream.accept_waveform(16000, pcm);
+    slot.recognizer.decode(&stream);
+    let text = stream
+        .get_result()
+        .map(|r| r.text)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return None;
+    }
+    slot.finals.push(text.clone());
+    slot.all_finals.push(text.clone());
+    if slot.finals.len() > FINALS_RETAIN {
+        slot.finals.remove(0);
+    }
+    Some(text)
+}
+
+// ─── VAD 状态机（离线槽共享）──────────────────────────────────────────
+//
+// 从主采集 rx 收帧后：
+//   1. 所有 Online slot 增量喂音（原有逻辑）
+//   2. 同时累积到 vad_buffer
+//   3. RMS < 阈值累计 >= VAD_SILENCE_SEC → 触发：把 vad_buffer 喂给所有 Offline slot
+//   4. 或 vad_buffer 时长 >= VAD_MAX_BUFFER_SEC → 强制触发（兜底）
+
+struct VadState {
+    buffer: Vec<f32>,
+    /// 当前是否在"说话态"。true 表示正在累积一段语音。
+    speaking: bool,
+    /// 连续静音的采样数。
+    silence_samples: usize,
+    /// 阈值（可通过 env 覆盖）。
+    rms_threshold: f32,
+}
+
+impl VadState {
+    fn new() -> Self {
+        let rms_threshold = std::env::var("VAD_RMS_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(VAD_RMS_THRESHOLD);
+        Self {
+            buffer: Vec::new(),
+            speaking: false,
+            silence_samples: 0,
+            rms_threshold,
+        }
+    }
+
+    /// 喂入一帧。返回 Some(segment) 表示 VAD 触发，应把这段喂给离线模型。
+    fn push(&mut self, pcm: &[f32], log: &mut Vec<String>) -> Option<Vec<f32>> {
+        let frame_rms = rms(pcm);
+        self.buffer.extend_from_slice(pcm);
+
+        let now_speaking = frame_rms >= self.rms_threshold;
+        if now_speaking {
+            self.speaking = true;
+            self.silence_samples = 0;
+        } else if self.speaking {
+            self.silence_samples += pcm.len();
+        }
+
+        let silence_limit = (VAD_SILENCE_SEC * 16000.0) as usize;
+        let buffer_limit = (VAD_MAX_BUFFER_SEC * 16000.0) as usize;
+
+        // 触发条件 1：说话后静音超过 silence_limit
+        let silence_triggered = self.speaking && self.silence_samples >= silence_limit;
+        // 触发条件 2：缓冲达到上限强制切（兜底，防止背景音乐持续高于阈值）
+        let force_triggered = self.buffer.len() >= buffer_limit;
+
+        if silence_triggered || force_triggered {
+            if self.buffer.is_empty() {
+                return None;
+            }
+            let reason = if force_triggered {
+                "max-buffer"
+            } else {
+                "silence"
+            };
+            let secs = self.buffer.len() as f32 / 16000.0;
+            if log.len() < 200 {
+                log.push(format!(
+                    "[VAD] 触发({reason}): {secs:.1}s 缓冲, rms={frame_rms:.4}"
+                ));
+            }
+            let segment = std::mem::take(&mut self.buffer);
+            self.speaking = false;
+            self.silence_samples = 0;
+            Some(segment)
+        } else {
+            None
+        }
+    }
+
+    fn reset(&mut self) {
+        self.buffer.clear();
+        self.speaking = false;
+        self.silence_samples = 0;
+    }
+}
+
+// ─── 统一槽位枚举 ─────────────────────────────────────────────────────
+
+enum AnySlot {
+    Online(OnlineSlot),
+    OfflineCanary(OfflineCanarySlot),
+}
+
+impl AnySlot {
+    fn name(&self) -> &str {
+        match self {
+            AnySlot::Online(s) => s.name,
+            AnySlot::OfflineCanary(s) => s.name,
+        }
+    }
+
+    fn is_online(&self) -> bool {
+        matches!(self, AnySlot::Online(_))
+    }
+
+    fn build(desc: &ModelDesc) -> Result<Self> {
+        match desc.kind {
+            SlotKind::Online(_) => Ok(Self::Online(build_online_slot(desc)?)),
+            SlotKind::OfflineCanary => Ok(Self::OfflineCanary(build_canary_slot(desc)?)),
+        }
+    }
+}
+
+/// 给 AnySlot 的字段访问提供统一接口（渲染/报告/toggle 共用）。
+trait SlotView {
+    fn partial(&self) -> &str;
+    fn finals(&self) -> &[String];
+    fn all_finals(&self) -> &[String];
+    fn enabled(&self) -> bool;
+    fn finals_scroll(&self) -> u16;
+    fn finals_scroll_mut(&mut self) -> &mut u16;
+    fn set_enabled(&mut self, enabled: bool);
+    fn clear(&mut self);
+}
+
+macro_rules! impl_slot_view {
+    ($ty:ty) => {
+        impl SlotView for $ty {
+            fn partial(&self) -> &str {
+                &self.partial
+            }
+            fn finals(&self) -> &[String] {
+                &self.finals
+            }
+            fn all_finals(&self) -> &[String] {
+                &self.all_finals
+            }
+            fn enabled(&self) -> bool {
+                self.enabled
+            }
+            fn finals_scroll(&self) -> u16 {
+                self.finals_scroll
+            }
+            fn finals_scroll_mut(&mut self) -> &mut u16 {
+                &mut self.finals_scroll
+            }
+            fn set_enabled(&mut self, enabled: bool) {
+                self.enabled = enabled;
+                if !enabled {
+                    self.partial.clear();
+                }
+            }
+            fn clear(&mut self) {
+                self.partial.clear();
+                self.finals.clear();
+                self.all_finals.clear();
+                self.finals_scroll = 0;
+            }
+        }
+    };
+}
+impl SlotView for OnlineSlot {
+    fn partial(&self) -> &str {
+        &self.partial
+    }
+    fn finals(&self) -> &[String] {
+        &self.finals
+    }
+    fn all_finals(&self) -> &[String] {
+        &self.all_finals
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn finals_scroll(&self) -> u16 {
+        self.finals_scroll
+    }
+    fn finals_scroll_mut(&mut self) -> &mut u16 {
+        &mut self.finals_scroll
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.partial.clear();
+        }
+    }
+    fn clear(&mut self) {
+        self.partial.clear();
+        self.all_partials.clear();
+        self.finals.clear();
+        self.all_finals.clear();
+        self.finals_scroll = 0;
+    }
+}
+impl_slot_view!(OfflineCanarySlot);
+
+impl SlotView for AnySlot {
+    fn partial(&self) -> &str {
+        match self {
+            AnySlot::Online(s) => s.partial(),
+            AnySlot::OfflineCanary(s) => s.partial(),
+        }
+    }
+    fn finals(&self) -> &[String] {
+        match self {
+            AnySlot::Online(s) => s.finals(),
+            AnySlot::OfflineCanary(s) => s.finals(),
+        }
+    }
+    fn all_finals(&self) -> &[String] {
+        match self {
+            AnySlot::Online(s) => s.all_finals(),
+            AnySlot::OfflineCanary(s) => s.all_finals(),
+        }
+    }
+    fn enabled(&self) -> bool {
+        match self {
+            AnySlot::Online(s) => s.enabled(),
+            AnySlot::OfflineCanary(s) => s.enabled(),
+        }
+    }
+    fn finals_scroll(&self) -> u16 {
+        match self {
+            AnySlot::Online(s) => s.finals_scroll(),
+            AnySlot::OfflineCanary(s) => s.finals_scroll(),
+        }
+    }
+    fn finals_scroll_mut(&mut self) -> &mut u16 {
+        match self {
+            AnySlot::Online(s) => s.finals_scroll_mut(),
+            AnySlot::OfflineCanary(s) => s.finals_scroll_mut(),
+        }
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        match self {
+            AnySlot::Online(s) => s.set_enabled(enabled),
+            AnySlot::OfflineCanary(s) => s.set_enabled(enabled),
+        }
+    }
+    fn clear(&mut self) {
+        match self {
+            AnySlot::Online(s) => s.clear(),
+            AnySlot::OfflineCanary(s) => s.clear(),
+        }
+    }
 }
 
 // ─── 设备选择与采集抽象 ──────────────────────────────────────────────
@@ -280,35 +741,405 @@ fn list_outputs() -> Vec<OutputDevice> {
 
 // ─── 应用状态 ─────────────────────────────────────────────────────────
 
+#[derive(Clone)]
+struct SubtitleCue {
+    index: usize,
+    start_ms: u64,
+    end_ms: u64,
+    text: String,
+}
+
+struct MediaState {
+    audio_path: PathBuf,
+    srt_path: PathBuf,
+    cues: Vec<SubtitleCue>,
+    duration_ms: u64,
+    position_ms: u64,
+    anchor_ms: u64,
+    anchor_started_at: Instant,
+    playing: bool,
+    child: Option<Child>,
+    last_report: Option<PathBuf>,
+}
+
+impl MediaState {
+    fn load_default() -> Result<Option<Self>> {
+        let audio_path = PathBuf::from(DEFAULT_MEDIA_MP3);
+        let srt_path = PathBuf::from(DEFAULT_MEDIA_SRT);
+        if !audio_path.exists() || !srt_path.exists() {
+            return Ok(None);
+        }
+        let cues = parse_srt(&srt_path)?;
+        let duration_ms = cues.last().map(|cue| cue.end_ms).unwrap_or(0);
+        Ok(Some(Self {
+            audio_path,
+            srt_path,
+            cues,
+            duration_ms,
+            position_ms: 0,
+            anchor_ms: 0,
+            anchor_started_at: Instant::now(),
+            playing: false,
+            child: None,
+            last_report: None,
+        }))
+    }
+
+    fn start(&mut self) -> Result<()> {
+        self.stop_child();
+        self.anchor_ms = self.position_ms;
+        self.anchor_started_at = Instant::now();
+        self.playing = true;
+        self.child = Some(spawn_ffplay(&self.audio_path, self.position_ms)?);
+        Ok(())
+    }
+
+    fn stop_child(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn pause(&mut self) {
+        self.refresh_position();
+        self.playing = false;
+        self.stop_child();
+    }
+
+    fn toggle_play(&mut self) -> Result<()> {
+        if self.playing {
+            self.pause();
+            Ok(())
+        } else {
+            self.start()
+        }
+    }
+
+    fn refresh_position(&mut self) {
+        if self.playing {
+            self.position_ms = self.anchor_ms + self.anchor_started_at.elapsed().as_millis() as u64;
+        }
+    }
+
+    fn seek_by(&mut self, delta_ms: i64) -> Result<()> {
+        self.refresh_position();
+        self.position_ms = if delta_ms.is_negative() {
+            self.position_ms.saturating_sub(delta_ms.unsigned_abs())
+        } else {
+            self.position_ms.saturating_add(delta_ms as u64)
+        };
+        if self.duration_ms > 0 {
+            self.position_ms = self.position_ms.min(self.duration_ms);
+        }
+        if self.playing {
+            self.start()?;
+        }
+        Ok(())
+    }
+
+    fn active_index(&self) -> usize {
+        if self.cues.is_empty() {
+            return 0;
+        }
+        match self.cues.binary_search_by(|cue| {
+            if self.position_ms < cue.start_ms {
+                std::cmp::Ordering::Greater
+            } else if self.position_ms > cue.end_ms {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }
+    }
+}
+
+impl Drop for MediaState {
+    fn drop(&mut self) {
+        self.stop_child();
+    }
+}
+
+fn parse_srt(path: &Path) -> Result<Vec<SubtitleCue>> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("读取字幕失败: {}", path.display()))?;
+    let normalized = raw.replace("\r\n", "\n");
+    let mut cues = Vec::new();
+
+    for block in normalized.split("\n\n") {
+        let mut lines = block.lines().filter(|line| !line.trim().is_empty());
+        let Some(index_line) = lines.next() else {
+            continue;
+        };
+        let Ok(index) = index_line.trim().parse::<usize>() else {
+            continue;
+        };
+        let Some(time_line) = lines.next() else {
+            continue;
+        };
+        let Some((start, end)) = time_line.split_once("-->") else {
+            continue;
+        };
+        let text = lines.collect::<Vec<_>>().join(" ").trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        cues.push(SubtitleCue {
+            index,
+            start_ms: parse_srt_time(start.trim())?,
+            end_ms: parse_srt_time(end.trim())?,
+            text,
+        });
+    }
+
+    Ok(cues)
+}
+
+fn parse_srt_time(input: &str) -> Result<u64> {
+    let Some((hms, millis)) = input.split_once(',') else {
+        anyhow::bail!("无效字幕时间: {input}");
+    };
+    let parts = hms
+        .split(':')
+        .map(str::parse::<u64>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if parts.len() != 3 {
+        anyhow::bail!("无效字幕时间: {input}");
+    }
+    let millis = millis.trim().parse::<u64>()?;
+    Ok(((parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000) + millis)
+}
+
+fn spawn_ffplay(audio_path: &Path, position_ms: u64) -> Result<Child> {
+    let seek_seconds = format!("{:.3}", position_ms as f64 / 1000.0);
+    Command::new("ffplay")
+        .arg("-nodisp")
+        .arg("-autoexit")
+        .arg("-loglevel")
+        .arg("quiet")
+        .arg("-ss")
+        .arg(seek_seconds)
+        .arg(audio_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| "启动 ffplay 失败，请确认 ffplay 在 PATH 中")
+}
+
+fn format_media_time(ms: u64) -> String {
+    let total = ms / 1000;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+fn media_progress_bar(position_ms: u64, duration_ms: u64, width: usize) -> String {
+    if duration_ms == 0 || width == 0 {
+        return " ".repeat(width);
+    }
+    let filled = ((position_ms.min(duration_ms) as f64 / duration_ms as f64) * width as f64)
+        .round()
+        .clamp(0.0, width as f64) as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn export_report(app: &App) -> Result<PathBuf> {
+    fs::create_dir_all("reports").context("创建 reports 目录失败")?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let path = PathBuf::from(format!("reports/asr_report_{now}.md"));
+    let mut out = String::new();
+
+    out.push_str("# ASR Compare Report\n\n");
+    out.push_str(&format!("- source: {}\n", app.source_label));
+    out.push_str(&format!(
+        "- runtime: {}\n",
+        humantime_elapsed(app.started_at)
+    ));
+
+    if let Some(media) = &app.media {
+        out.push_str(&format!("- audio: {}\n", media.audio_path.display()));
+        out.push_str(&format!("- subtitle: {}\n", media.srt_path.display()));
+        out.push_str(&format!(
+            "- position: {} ({:.3}s)\n",
+            format_media_time(media.position_ms),
+            media.position_ms as f64 / 1000.0
+        ));
+        out.push_str("\n## Subtitle Context\n\n");
+        if media.cues.is_empty() {
+            out.push_str("<no subtitles parsed>\n");
+        } else {
+            let active = media.active_index();
+            let start = active.saturating_sub(3);
+            let end = (active + 4).min(media.cues.len());
+            for cue in &media.cues[start..end] {
+                let marker = if cue.index == media.cues[active].index {
+                    ">"
+                } else {
+                    "-"
+                };
+                out.push_str(&format!(
+                    "{marker} [{} - {}] {}\n",
+                    format_media_time(cue.start_ms),
+                    format_media_time(cue.end_ms),
+                    cue.text
+                ));
+            }
+        }
+    }
+
+    out.push_str("\n## ASR Results\n");
+    for slot in &app.slots {
+        out.push_str(&format!("\n### {}\n\n", slot.name()));
+        if !slot.partial().trim().is_empty() {
+            out.push_str(&format!("partial: {}\n\n", slot.partial().trim()));
+        }
+        if let AnySlot::Online(s) = slot {
+            if !s.all_partials.is_empty() {
+                out.push_str(&format!(
+                    "partial_history_count: {}\n\n",
+                    s.all_partials.len()
+                ));
+                out.push_str("partial_history:\n\n");
+                for (idx, partial) in s.all_partials.iter().enumerate() {
+                    out.push_str(&format!("{}. {}\n", idx + 1, partial.trim()));
+                }
+                out.push('\n');
+            }
+        }
+        if slot.all_finals().is_empty() {
+            out.push_str("finals: <none>\n");
+        } else {
+            out.push_str(&format!("final_count: {}\n\n", slot.all_finals().len()));
+            for (idx, final_text) in slot.all_finals().iter().enumerate() {
+                out.push_str(&format!("{}. {}\n", idx + 1, final_text.trim()));
+            }
+        }
+    }
+
+    fs::write(&path, out).with_context(|| format!("写入报告失败: {}", path.display()))?;
+    Ok(path)
+}
+
 struct App {
-    slots: Vec<ModelSlot>,
+    slots: Vec<AnySlot>,
+    /// 离线槽共享的 VAD 状态机。喂音时 Online 槽增量吃帧，离线槽等 VAD 触发。
+    vad: VadState,
     log: Vec<String>,
     last_rms: f32,
     started_at: Instant,
     source_label: String,
+    active_slot: usize,
+    media: Option<MediaState>,
 }
 
 impl App {
     fn clear(&mut self) {
         for slot in &mut self.slots {
-            slot.partial.clear();
-            slot.finals.clear();
+            slot.clear();
         }
+        self.vad.reset();
         self.log.clear();
     }
 
     fn toggle(&mut self, index: usize) {
         if let Some(slot) = self.slots.get_mut(index) {
-            slot.enabled = !slot.enabled;
-            if !slot.enabled {
-                slot.partial.clear();
-            }
-            let state = if slot.enabled { "启用" } else { "禁用" };
-            self.log.push(format!("[{}] 已{}", slot.name, state));
+            let new_enabled = !slot.enabled();
+            slot.set_enabled(new_enabled);
+            let name = slot.name().to_string();
+            let state = if new_enabled { "启用" } else { "禁用" };
+            self.log.push(format!("[{name}] 已{state}"));
             if self.log.len() > 50 {
                 self.log.remove(0);
             }
         }
+    }
+
+    fn active_slot_mut(&mut self) -> Option<&mut AnySlot> {
+        self.slots.get_mut(self.active_slot)
+    }
+
+    fn move_active_slot(&mut self, delta: isize) {
+        if self.slots.is_empty() {
+            self.active_slot = 0;
+            return;
+        }
+        let last = self.slots.len().saturating_sub(1) as isize;
+        let next = (self.active_slot as isize + delta).clamp(0, last);
+        self.active_slot = next as usize;
+    }
+
+    fn scroll_active_slot(&mut self, delta: i16) {
+        if let Some(slot) = self.active_slot_mut() {
+            let s = slot.finals_scroll_mut();
+            if delta.is_negative() {
+                *s = s.saturating_sub(delta.unsigned_abs());
+            } else {
+                *s = s.saturating_add(delta as u16);
+            }
+        }
+    }
+
+    fn reset_active_scroll(&mut self) {
+        if let Some(slot) = self.active_slot_mut() {
+            *slot.finals_scroll_mut() = 0;
+        }
+    }
+
+    fn refresh_media(&mut self) {
+        if let Some(media) = &mut self.media {
+            media.refresh_position();
+        }
+    }
+
+    fn handle_media_key(&mut self, key: &KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char(' ') => {
+                if let Some(media) = &mut self.media {
+                    media.toggle_play()?;
+                }
+            }
+            KeyCode::Char('h') => {
+                if let Some(media) = &mut self.media {
+                    media.seek_by(-10_000)?;
+                }
+            }
+            KeyCode::Char('l') => {
+                if let Some(media) = &mut self.media {
+                    media.seek_by(10_000)?;
+                }
+            }
+            KeyCode::Char('H') => {
+                if let Some(media) = &mut self.media {
+                    media.seek_by(-60_000)?;
+                }
+            }
+            KeyCode::Char('L') => {
+                if let Some(media) = &mut self.media {
+                    media.seek_by(60_000)?;
+                }
+            }
+            KeyCode::Char('e') => {
+                let path = export_report(self)?;
+                if let Some(media) = &mut self.media {
+                    media.last_report = Some(path.clone());
+                }
+                self.log.push(format!("报告已导出: {}", path.display()));
+                if self.log.len() > 50 {
+                    self.log.remove(0);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -317,7 +1148,10 @@ impl App {
 fn run_selection_screen(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<Option<Vec<usize>>> {
-    let mut selected = vec![true; MODEL_DESCS.len()];
+    // 每个模型是否就绪：流式模型恒 true，离线模型检测文件是否齐全。
+    // 不就绪的模型在选择屏打灰、不可勾选（优雅降级）。
+    let available: Vec<bool> = MODEL_DESCS.iter().map(|d| d.files_present()).collect();
+    let mut selected: Vec<bool> = available.iter().map(|&ok| ok).collect();
 
     loop {
         terminal.draw(|frame| {
@@ -340,19 +1174,45 @@ fn run_selection_screen(
 
             let mut lines: Vec<Line> = Vec::new();
             for (i, desc) in MODEL_DESCS.iter().enumerate() {
-                let check = if selected[i] { "[x]" } else { "[ ]" };
+                let ok = available[i];
+                let check = if !ok {
+                    "    " // 缺文件：不可勾选
+                } else if selected[i] {
+                    "[x] "
+                } else {
+                    "[ ] "
+                };
                 let lang = match desc.language {
                     Language::Chinese => "中文",
                     Language::English => "英文",
                 };
-                let style = if selected[i] {
+                let kind_tag = match desc.kind {
+                    SlotKind::Online(_) => "流式",
+                    SlotKind::OfflineCanary => "离线+VAD",
+                };
+                let style = if !ok {
+                    Style::default().fg(Color::DarkGray)
+                } else if selected[i] {
                     Style::default().fg(Color::Green)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(Color::Gray)
+                };
+                let key_span = if ok {
+                    Span::styled(format!(" {} ", i + 1), Style::default().fg(Color::Yellow))
+                } else {
+                    Span::raw(format!(" {} ", i + 1))
+                };
+                let suffix = if !ok {
+                    "  (未下载: ./scripts/download-canary.sh)"
+                } else {
+                    ""
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!(" {} ", i + 1), Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{check} {} ({lang})", desc.name), style),
+                    key_span,
+                    Span::styled(
+                        format!("{check}{} ({lang}/{kind_tag}){suffix}", desc.name),
+                        style,
+                    ),
                 ]));
             }
             lines.push(Line::from(""));
@@ -384,9 +1244,12 @@ fn run_selection_screen(
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
-                    KeyCode::Char('1') => selected[0] = !selected[0],
-                    KeyCode::Char('2') => selected[1] = !selected[1],
-                    KeyCode::Char('3') => selected[2] = !selected[2],
+                    KeyCode::Char(c @ '1'..='9') => {
+                        let idx = (c as u8 - b'1') as usize;
+                        if idx < selected.len() && available[idx] {
+                            selected[idx] = !selected[idx];
+                        }
+                    }
                     KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
                         let indices: Vec<usize> = selected
                             .iter()
@@ -759,7 +1622,7 @@ fn main() -> Result<()> {
 
     let mut slots = Vec::with_capacity(indices.len());
     for &i in &indices {
-        slots.push(build_slot(&MODEL_DESCS[i])?);
+        slots.push(AnySlot::build(&MODEL_DESCS[i])?);
     }
 
     // 阶段 3 + 4：设备选择 → 预览。两屏之间可往返（预览 Esc 回设备选择）。
@@ -784,13 +1647,30 @@ fn main() -> Result<()> {
         }
     };
 
+    let media = MediaState::load_default()?;
     let mut app = App {
         slots,
+        vad: VadState::new(),
         log: Vec::new(),
         last_rms: 0.0,
         started_at: Instant::now(),
         source_label,
+        active_slot: 0,
+        media,
     };
+    if let Some(media) = &mut app.media {
+        match media.start() {
+            Ok(()) => app.log.push(format!(
+                "已开始播放: {}",
+                media
+                    .audio_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            )),
+            Err(e) => app.log.push(format!("音频播放启动失败: {e:#}")),
+        }
+    }
 
     // 阶段 5：主 TUI 循环。
     let result = run_loop(&mut terminal, &mut app, &mut rx);
@@ -813,12 +1693,29 @@ fn run_loop(
     loop {
         while let Ok(frame) = rx.try_recv() {
             app.last_rms = rms(&frame);
+
+            // 1) 流式槽：增量喂当前帧（沿用原有 feed 逻辑）。
             for slot in &mut app.slots {
-                if let Some(final_text) = feed_frame(slot, &frame) {
-                    app.log
-                        .push(format!("[{}] final: {}", slot.name, final_text));
-                    if app.log.len() > 50 {
-                        app.log.remove(0);
+                if let AnySlot::Online(s) = slot {
+                    if let Some(final_text) = feed_online_frame(s, &frame) {
+                        app.log.push(format!("[{}] final: {}", s.name, final_text));
+                        if app.log.len() > 200 {
+                            app.log.remove(0);
+                        }
+                    }
+                }
+            }
+
+            // 2) 离线槽：喂 VAD 状态机；触发时把整段广播给所有离线槽。
+            if let Some(segment) = app.vad.push(&frame, &mut app.log) {
+                for slot in &mut app.slots {
+                    if let AnySlot::OfflineCanary(s) = slot {
+                        if let Some(final_text) = decode_canary_segment(s, &segment) {
+                            app.log.push(format!("[{}] final: {}", s.name, final_text));
+                            if app.log.len() > 200 {
+                                app.log.remove(0);
+                            }
+                        }
                     }
                 }
             }
@@ -832,15 +1729,25 @@ fn run_loop(
                 if matches!(key.code, KeyCode::Char('c')) {
                     app.clear();
                 }
+                app.handle_media_key(&key)?;
                 match key.code {
-                    KeyCode::Char('1') => app.toggle(0),
-                    KeyCode::Char('2') => app.toggle(1),
-                    KeyCode::Char('3') => app.toggle(2),
+                    KeyCode::Left => app.move_active_slot(-1),
+                    KeyCode::Right => app.move_active_slot(1),
+                    KeyCode::Up => app.scroll_active_slot(-1),
+                    KeyCode::Down => app.scroll_active_slot(1),
+                    KeyCode::PageUp => app.scroll_active_slot(-6),
+                    KeyCode::PageDown => app.scroll_active_slot(6),
+                    KeyCode::Home => app.reset_active_scroll(),
+                    KeyCode::Char(c @ '1'..='9') => {
+                        let idx = (c as u8 - b'1') as usize;
+                        app.toggle(idx);
+                    }
                     _ => {}
                 }
             }
         }
 
+        app.refresh_media();
         terminal.draw(|frame| draw(app, frame))?;
     }
 }
@@ -883,6 +1790,12 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw("· "),
+        Span::styled("←/→", Style::default().fg(Color::Yellow)),
+        Span::raw(" 选列 · "),
+        Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
+        Span::raw(" 滚动 · "),
+        Span::styled("PgUp/PgDn", Style::default().fg(Color::Yellow)),
+        Span::raw(" 快速滚动 · "),
         Span::styled("q", Style::default().fg(Color::Yellow)),
         Span::raw(" 退出 · "),
         Span::styled("c", Style::default().fg(Color::Yellow)),
@@ -896,6 +1809,17 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     let top = Paragraph::new(title).block(Block::default().borders(Borders::ALL).title("实时对比"));
     frame.render_widget(top, chunks[0]);
 
+    let asr_area = if let Some(media) = &app.media {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+            .split(chunks[1]);
+        render_media_panel(media, frame, body[0]);
+        body[1]
+    } else {
+        chunks[1]
+    };
+
     let count = app.slots.len().max(1);
     let col_constraints: Vec<Constraint> = (0..count)
         .map(|_| Constraint::Ratio(1, count as u32))
@@ -903,42 +1827,83 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(col_constraints)
-        .split(chunks[1]);
+        .split(asr_area);
 
-    for (slot, col_area) in app.slots.iter_mut().zip(columns.iter()) {
-        let dim = !slot.enabled;
+    for (index, (slot, col_area)) in app.slots.iter_mut().zip(columns.iter()).enumerate() {
+        let is_active = index == app.active_slot;
+        let dim = !slot.enabled();
+        let is_offline = !slot.is_online();
         let text_style = if dim {
             Style::default().fg(Color::DarkGray)
         } else {
             Style::default()
         };
 
-        let mut lines: Vec<Line> = Vec::new();
-        let partial_label = if dim { "[已关闭]" } else { &slot.partial };
-        lines.push(Line::from(vec![
-            Span::styled("partial: ", Style::default().fg(Color::Cyan)),
-            Span::styled(partial_label.to_string(), text_style),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "— finals —",
-            Style::default().fg(Color::DarkGray),
-        )));
-        for f in &slot.finals {
-            lines.push(Line::from(Span::styled(format!("· {f}"), text_style)));
-        }
+        // partial 区：流式槽显示实时 partial；离线槽显示 VAD 等待状态。
+        let partial_label: String = if dim {
+            "[已关闭]".to_string()
+        } else if is_offline {
+            // 离线槽没有 partial，显示 VAD 缓冲长度提示
+            let secs = app.vad.buffer.len() as f32 / 16000.0;
+            if app.vad.speaking {
+                format!("（离线·录音中 {secs:.1}s，VAD 触发后出结果）")
+            } else {
+                "（离线·等待说话触发 VAD）".to_string()
+            }
+        } else {
+            slot.partial().to_string()
+        };
+        let partial_caption = if is_offline && !dim {
+            "vad: "
+        } else {
+            "partial: "
+        };
+        let partial_lines = vec![Line::from(vec![
+            Span::styled(partial_caption, Style::default().fg(Color::Cyan)),
+            Span::styled(partial_label, text_style),
+        ])];
         let title_suffix = if dim { " [关]" } else { "" };
         let title_style = if dim {
             Style::default().fg(Color::DarkGray)
+        } else if is_active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default().borders(Borders::ALL).title(Span::styled(
-                format!(" {}{} ", slot.name, title_suffix),
+        let col_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(5), Constraint::Min(5)])
+            .split(*col_area);
+        let partial_para = Paragraph::new(partial_lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(Span::styled(
+                format!(" {}{} ", slot.name(), title_suffix),
                 title_style,
-            )),
-        );
-        frame.render_widget(para, *col_area);
+            )));
+        frame.render_widget(partial_para, col_layout[0]);
+
+        let mut finals_lines: Vec<Line> = Vec::new();
+        for f in slot.finals() {
+            finals_lines.push(Line::from(Span::styled(format!("· {f}"), text_style)));
+        }
+        if finals_lines.is_empty() {
+            finals_lines.push(Line::from(Span::styled(
+                "（暂无 final）",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        let finals_title = if is_active {
+            " finals (active) "
+        } else {
+            " finals "
+        };
+        let finals_para = Paragraph::new(finals_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((slot.finals_scroll(), 0))
+            .block(Block::default().borders(Borders::ALL).title(finals_title));
+        frame.render_widget(finals_para, col_layout[1]);
     }
 
     let log_lines: Vec<Line> = app
@@ -954,4 +1919,77 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
             .title("日志（最近 endpoint）"),
     );
     frame.render_widget(log_para, chunks[2]);
+}
+
+fn render_media_panel(media: &MediaState, frame: &mut ratatui::Frame, area: Rect) {
+    let active = media.active_index();
+    let title = if media.playing {
+        " subtitles playing "
+    } else {
+        " subtitles paused "
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("time: ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!(
+                    "{} / {}",
+                    format_media_time(media.position_ms),
+                    format_media_time(media.duration_ms)
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(Span::styled(
+            media_progress_bar(media.position_ms, media.duration_ms, 28),
+            Style::default().fg(Color::Green),
+        )),
+        Line::from(vec![
+            Span::styled("seek: ", Style::default().fg(Color::Cyan)),
+            Span::raw("h/l 10s · H/L 60s · space pause · e report"),
+        ]),
+        Line::from(""),
+    ];
+
+    if media.cues.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "未解析到字幕",
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        let start = active.saturating_sub(8);
+        let end = (active + 10).min(media.cues.len());
+        for cue in &media.cues[start..end] {
+            let is_active = media.position_ms >= cue.start_ms && media.position_ms <= cue.end_ms;
+            let style = if is_active {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let marker = if is_active { ">" } else { " " };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{marker} {} {}",
+                    format_media_time(cue.start_ms),
+                    cue.text.replace('\n', " ")
+                ),
+                style,
+            )));
+        }
+    }
+
+    if let Some(path) = &media.last_report {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("report: {}", path.display()),
+            Style::default().fg(Color::Green),
+        )));
+    }
+
+    let panel = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(panel, area);
 }

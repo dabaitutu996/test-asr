@@ -1,1 +1,15 @@
 target/
+/ARC_Raiders_is_getting_DARKER....en.srt
+/ARC_Raiders_is_getting_DARKER....f400.mp4.part
+/ARC_Raiders_is_getting_DARKER....mp3
+
+# ASR 模型（体积大，不提交；按需用 scripts/download-canary.sh 拉取）
+models/
+# 导出的对比报告
+reports/
+# Python 虚拟环境（仅用于模型导出/验证脚本，不属于项目运行依赖）
+.venv-*/
+
+/docs
+/open_asr_leaderboard/
+/scripts/download-*.sh
