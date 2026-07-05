@@ -17,8 +17,9 @@
 
 **流式 vs 离线的差异**：
 - 流式模型逐帧增量喂音，自带 partial（实时显示正在识别的内容）和 endpoint（自动断句）。
-- 离线模型（Canary）没有 partial/endpoint，靠内置 RMS 能量 VAD 检测静音句尾，
-  0.4 秒静音触发一次性解码，结果直接作为 final 输出。
+- 离线模型（Canary / Parakeet）没有 partial/endpoint，默认共用同一个 Silero VAD
+  segment；每次 VAD 完成切段后，所有启用的离线模型同时解码同一段音频，结果直接作为
+  final 输出。
 
 ## 运行
 
@@ -41,8 +42,8 @@ cargo run
 ```
 
 启动后：
-1. **选择引擎屏**：数字键 1-9 勾选要加载的模型。Canary 若未下载会显示为灰色不可选，
-   并提示运行 `./scripts/download-canary.sh`。Enter 确认。
+1. **选择引擎屏**：数字键 1-9 勾选要加载的模型。离线模型若未下载会显示为灰色不可选，
+   并提示对应的下载脚本。Enter 确认。
 2. **设备选择屏**：选输入端（麦克风）或输出端（系统音频，如 BlackHole 2ch）。
 3. **预览屏**：观察电平是否跳动，确认采集源正确。Enter 进入主屏。
 4. **主屏**：多列并行显示各模型的 partial / finals。
@@ -53,28 +54,34 @@ cargo run
 
 ## VAD 参数调优
 
-离线槽用 RMS 能量 VAD 触发解码，参数（`src/main.rs` 顶部常量）：
+离线槽默认使用 sherpa-onnx 的 Silero VAD。RMS 能量 VAD 仍保留为兜底/调试路径：
 
-| 常量 | 默认值 | 含义 |
-|---|---|---|
-| `VAD_RMS_THRESHOLD` | 0.012 | RMS 低于此值视为静音。可用 `VAD_RMS_THRESHOLD=0.02 cargo run` 覆盖 |
-| `VAD_SILENCE_SEC` | 0.4 | 说话后静音多少秒触发解码 |
-| `VAD_MAX_BUFFER_SEC` | 8.0 | 缓冲上限强制触发（防止背景音乐持续高于阈值导致一直不触发） |
+| 环境变量 | 默认值 | 含义 |
+|---|---:|---|
+| `VAD_BACKEND` | `silero` | 可设为 `silero` 或 `rms` |
+| `SILERO_VAD_MODEL` | `models/vad/silero_vad/silero_vad.int8.onnx` | Silero 模型路径 |
+| `SILERO_VAD_THRESHOLD` | `0.5` | Silero 语音概率阈值 |
+| `SILERO_VAD_MIN_SILENCE_SEC` | `0.5` | 静音多久后结束 segment |
+| `SILERO_VAD_MIN_SPEECH_SEC` | `0.25` | 最短语音段 |
+| `SILERO_VAD_MAX_SPEECH_SEC` | `8.0` | 最长语音段，超出会强制切段 |
 
-**游戏场景调优建议**：游戏背景音乐可能持续高于阈值，导致 VAD 一直判定"说话中"。
-这时 `VAD_MAX_BUFFER_SEC` 的 8 秒兜底会强制触发，但延迟较高。可以把阈值调高
-（如 `VAD_RMS_THRESHOLD=0.03`）或缩短最大缓冲（如 `VAD_MAX_BUFFER_SEC=4`）。
+RMS 兜底：
+
+```bash
+VAD_BACKEND=rms VAD_RMS_THRESHOLD=0.02 cargo run
+```
 
 ## 项目结构
 
 ```
 src/main.rs          TUI 主程序（采集 → 喂音 → 渲染）
+src/system_audio/    本仓库内置的 macOS Core Audio Process Tap 采集实现
 scripts/
   download-canary.sh 下载 Canary-180m-flash int8 模型（sherpa-onnx 官方 release）
   download-silero-vad.sh 下载 Silero VAD int8（sherpa-onnx 官方 release）
   download-parakeet-tdt-ctc-110m.sh 下载 Parakeet 110M INT8（sherpa-onnx 官方 release）
 测试                  cargo run 的薄封装
-Cargo.toml           依赖：arcvoice-core（流式槽）+ sherpa-onnx（离线槽）
+Cargo.toml           依赖：arcvoice-core（流式槽）+ sherpa-onnx（离线槽/VAD）
 ```
 
 模型默认路径：`../../game-video/engine/models/streaming/`（流式模型）和
@@ -96,5 +103,5 @@ Cargo.toml           依赖：arcvoice-core（流式槽）+ sherpa-onnx（离线
 - 即使强行导出，streaming encoder 的滑动窗口 ~50Hz 前端与 sherpa-onnx 内置的
   80 维 mel 预处理不兼容（实测 community 的 streaming-small ONNX 加载成功但识别报错）
 
-代码里 `SlotKind::OfflineCanary` 已为未来扩展预留：若 sherpa-onnx 未来原生支持
-streaming 系列，加一个枚举值 + build 函数即可。
+代码里 `OfflineFamily` 已承载离线模型扩展：不同离线模型只需要补充文件检测与
+`OfflineRecognizerConfig` 构建逻辑，并继续共用同一份 VAD segment。

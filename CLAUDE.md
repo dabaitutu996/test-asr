@@ -21,19 +21,22 @@ The model directory defaults to `../../game-video/engine/models/streaming/` (rel
 
 ## Architecture
 
-Single-file TUI app (`src/main.rs`) with three runtime phases:
+TUI app with `src/main.rs` as the entry point and `src/system_audio/` carrying the local macOS Process Tap capture code. Runtime phases:
 
-1. **Selection screen** — user picks which ASR engines to load (1/2/3 toggle, Enter confirms, q quits)
-2. **Model loading** — loads selected Sherpa models via `arcvoice_core` (suppresses C library stdout noise via fd redirect)
-3. **Main TUI loop** — captures system audio via `arcvoice_core::audio::system_audio`, feeds PCM frames to each engine's stream, renders partial/final results in columns using ratatui
+1. **Selection screen** — user picks which ASR engines to load (1-9 toggle, Enter confirms, q quits)
+2. **Model loading** — loads selected Sherpa online/offline models (suppresses C library stdout noise via fd redirect)
+3. **Main TUI loop** — captures system audio via local `asr_compare_tui::system_audio`, feeds PCM frames to online engines, broadcasts shared VAD segments to offline engines, and renders partial/final results in columns using ratatui
 
 Key types:
-- `ModelDesc` — static model metadata (name, subdir, SherpaModelType, language)
-- `ModelSlot` — runtime state per engine (stream, partial text, finals history, enabled flag)
-- `App` — holds all slots, log buffer, RMS level, start time
+- `ModelDesc` — static model metadata (name, subdir, backend kind, language)
+- `OnlineSlot` / `OfflineSlot` — runtime state per engine
+- `VadState` — shared Silero/RMS segmentation for offline models
+- `App` — holds all slots, VAD state, log buffer, RMS level, start time
 
 ## Dependencies
 
-- `arcvoice_core` (local path dep from `game-video/engine/crates/core`) — Sherpa ONNX bindings and system audio capture
+- `arcvoice_core` (local path dep from `game-video/engine/crates/core`) — Sherpa online ASR wrappers and microphone capture
+- `sherpa-onnx` — offline ASR and Silero VAD
+- `objc2` / `core-foundation` — local macOS system audio capture
 - `ratatui` + `crossterm` — TUI rendering
-- `tokio` — only used for `mpsc` channel (system audio → main loop)
+- `tokio` — `mpsc` channel (capture → main loop)

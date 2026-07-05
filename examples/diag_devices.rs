@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arcvoice_core::audio::system_audio;
+use asr_compare_tui::system_audio;
 use cpal::traits::{DeviceTrait, HostTrait};
 
 fn main() {

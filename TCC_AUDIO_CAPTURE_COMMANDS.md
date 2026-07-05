@@ -56,14 +56,8 @@ plutil -p '/System/Applications/Utilities/Terminal.app/Contents/Info.plist' | gr
 cargo run --example diag_devices
 ```
 
-engine 原版 example：
-
-```bash
-cd /Users/mima1234/Desktop/项目/game-video/engine
-cargo run --release --example 16_asr_compare_tui --features "manual-examples,system-audio,sherpa-onnx-models"
-```
-
-如果这两个都是 `frames=0`，同时第 1 步日志里又出现 `without NSAudioCaptureUsageDescription key`，就可以直接判定为宿主终端/TCC 问题。
+如果诊断 example 是 `frames=0`，同时第 1 步日志里又出现
+`without NSAudioCaptureUsageDescription key`，就可以直接判定为宿主终端/TCC 问题。
 
 ## 6. 建议结论
 

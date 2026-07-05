@@ -1,7 +1,7 @@
 //! ASR 模型对比 TUI 工具：采集系统音频，实时对比多个 Sherpa 流式模型的识别效果。
 //!
-//! 启动时进入选择界面，用 1/2/3 勾选要加载的引擎，Enter 确认，q 退出。
-//! 运行中：q / Esc / Ctrl-C 退出；c 清空历史；1/2/3 切换引擎启用/禁用。
+//! 启动时进入选择界面，用 1-9 勾选要加载的引擎，Enter 确认，q 退出。
+//! 运行中：q / Esc / Ctrl-C 退出；c 清空历史；1-9 切换引擎启用/禁用。
 //!
 //! 模型路径指向 game-video/engine/models/streaming/。
 //! 运行：cargo run
@@ -30,15 +30,16 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
-use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
+use sherpa_onnx::{
+    OfflineRecognizer, OfflineRecognizerConfig, OnlineRecognizer, OnlineRecognizerConfig,
+    OnlineStream, SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
+};
 use tokio::sync::mpsc;
 
-use arcvoice_core::asr::streaming::{
-    OnlineAsrEngine, OnlineAsrStream, SherpaConfig, SherpaModelType, SherpaOnlineAsrEngine,
-};
+use arcvoice_core::asr::streaming::SherpaModelType;
 use arcvoice_core::asr::Language;
 use arcvoice_core::audio::mic::MicInput;
-use arcvoice_core::audio::system_audio::{self, OutputDevice};
+use asr_compare_tui::system_audio::{self, OutputDevice};
 
 /// 顶部 partial 之外，每个 slot 最多保留多少条 final 历史。
 const FINALS_RETAIN: usize = 6;
@@ -50,13 +51,19 @@ const DEFAULT_MEDIA_MP3: &str = "ARC_Raiders_is_getting_DARKER....mp3";
 const DEFAULT_MEDIA_SRT: &str = "ARC_Raiders_is_getting_DARKER....en.srt";
 
 // ─── 离线模型 VAD 参数 ─────────────────────────────────────────────────
-/// RMS 低于此值视为静音（BlackHole 系统音频在无声段约 0.001-0.005；
-/// 解说语音通常 > 0.02）。可通过环境变量 VAD_RMS_THRESHOLD 覆盖。
+const VAD_SAMPLE_RATE: usize = 16_000;
+const SILERO_VAD_THRESHOLD: f32 = 0.5;
+const SILERO_VAD_MIN_SILENCE_SEC: f32 = 0.5;
+const SILERO_VAD_MIN_SPEECH_SEC: f32 = 0.25;
+const SILERO_VAD_MAX_SPEECH_SEC: f32 = 8.0;
+const SILERO_VAD_WINDOW_SIZE: i32 = 512;
+const SILERO_VAD_BUFFER_SEC: f32 = 10.0;
+
+/// RMS 低于此值视为静音；仅在 `VAD_BACKEND=rms` 时使用。
 const VAD_RMS_THRESHOLD: f32 = 0.012;
-/// 静音持续多少秒后触发离线解码（句尾判定）。
+/// RMS 兜底路径里，静音持续多少秒后触发离线解码。
 const VAD_SILENCE_SEC: f32 = 0.4;
-/// 缓冲最长多少秒强制触发解码（避免超长段 Canary 扛不住，也防止
-/// 游戏背景音乐持续高于阈值导致一直"说话态"不触发）。
+/// RMS 兜底路径里，缓冲最长多少秒强制触发解码。
 const VAD_MAX_BUFFER_SEC: f32 = 8.0;
 
 // ─── 工具函数 ──────────────────────────────────────────────────────────
@@ -121,6 +128,13 @@ fn offline_models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/streaming")
 }
 
+fn silero_vad_model_path() -> PathBuf {
+    if let Ok(path) = std::env::var("SILERO_VAD_MODEL") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/vad/silero_vad/silero_vad.int8.onnx")
+}
+
 // ─── 模型静态描述 ─────────────────────────────────────────────────────
 
 /// 区分流式（OnlineRecognizer，真流式 transducer）和离线（OfflineRecognizer，
@@ -129,8 +143,37 @@ fn offline_models_dir() -> PathBuf {
 enum SlotKind {
     /// sherpa-onnx OnlineRecognizer：Zipformer / Nemotron 等真流式 transducer。
     Online(SherpaModelType),
-    /// sherpa-onnx OfflineRecognizer：Canary-180m-flash（离线 + VAD 触发）。
-    OfflineCanary,
+    /// sherpa-onnx OfflineRecognizer：离线模型 + 共享 VAD 触发。
+    Offline(OfflineFamily),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum OfflineFamily {
+    Canary,
+    ParakeetNemoCtc,
+}
+
+impl OfflineFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Canary => "canary",
+            Self::ParakeetNemoCtc => "parakeet_nemo_ctc",
+        }
+    }
+
+    fn required_files(self) -> &'static [&'static str] {
+        match self {
+            Self::Canary => &["encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt"],
+            Self::ParakeetNemoCtc => &["model.int8.onnx", "tokens.txt"],
+        }
+    }
+
+    fn download_script(self) -> &'static str {
+        match self {
+            Self::Canary => "./scripts/download-canary.sh",
+            Self::ParakeetNemoCtc => "./scripts/download-parakeet-tdt-ctc-110m.sh",
+        }
+    }
 }
 
 struct ModelDesc {
@@ -146,12 +189,20 @@ impl ModelDesc {
     fn files_present(&self) -> bool {
         match self.kind {
             SlotKind::Online(_) => true,
-            SlotKind::OfflineCanary => {
+            SlotKind::Offline(family) => {
                 let dir = offline_models_dir().join(self.subdir);
-                dir.join("encoder.int8.onnx").exists()
-                    && dir.join("decoder.int8.onnx").exists()
-                    && dir.join("tokens.txt").exists()
+                family
+                    .required_files()
+                    .iter()
+                    .all(|filename| dir.join(filename).exists())
             }
+        }
+    }
+
+    fn missing_files_hint(&self) -> Option<&'static str> {
+        match self.kind {
+            SlotKind::Online(_) => None,
+            SlotKind::Offline(family) => Some(family.download_script()),
         }
     }
 }
@@ -178,7 +229,13 @@ const MODEL_DESCS: &[ModelDesc] = &[
     ModelDesc {
         name: "Canary-180m-flash",
         subdir: "canary-180m-flash",
-        kind: SlotKind::OfflineCanary,
+        kind: SlotKind::Offline(OfflineFamily::Canary),
+        language: Language::English,
+    },
+    ModelDesc {
+        name: "Parakeet-TDT-CTC-110M",
+        subdir: "parakeet-tdt-ctc-110m",
+        kind: SlotKind::Offline(OfflineFamily::ParakeetNemoCtc),
         language: Language::English,
     },
 ];
@@ -218,8 +275,8 @@ fn hotwords_from_env() -> Vec<String> {
 struct OnlineSlot {
     name: &'static str,
     #[allow(dead_code)]
-    engine: SherpaOnlineAsrEngine,
-    stream: Box<dyn OnlineAsrStream>,
+    recognizer: Arc<OnlineRecognizer>,
+    stream: OnlineStream,
     partial: String,
     all_partials: Vec<String>,
     finals: Vec<String>,
@@ -232,21 +289,54 @@ fn build_online_slot(desc: &ModelDesc) -> Result<OnlineSlot> {
     let model_dir = engine_models_dir().join(desc.subdir);
     let model_type = match desc.kind {
         SlotKind::Online(mt) => mt,
-        SlotKind::OfflineCanary => bail!("build_online_slot 收到 OfflineCanary"),
+        SlotKind::Offline(_) => bail!("build_online_slot 收到离线模型"),
     };
     let (rule1, rule2, rule3) = endpoint_rules_from_env();
-    let mut cfg = SherpaConfig::new(model_dir.clone(), model_type, desc.language)
-        .with_endpoint_rules(rule1, rule2, rule3);
-    if matches!(model_type, SherpaModelType::Zipformer) {
-        cfg = cfg.with_hotwords(hotwords_from_env());
+    let files = online_model_files(desc.name, &model_dir, model_type)?;
+    let hotwords = if matches!(model_type, SherpaModelType::Zipformer) {
+        hotwords_from_env()
+    } else {
+        Vec::new()
+    };
+    let mut cfg = OnlineRecognizerConfig::default();
+    cfg.feat_config.feature_dim = online_feature_dim(model_type);
+    cfg.model_config.transducer.encoder = Some(files.encoder.to_string_lossy().into_owned());
+    cfg.model_config.transducer.decoder = Some(files.decoder.to_string_lossy().into_owned());
+    cfg.model_config.transducer.joiner = Some(files.joiner.to_string_lossy().into_owned());
+    cfg.model_config.tokens = Some(files.tokens.to_string_lossy().into_owned());
+    cfg.model_config.num_threads = 1;
+    cfg.model_config.provider = Some("cpu".into());
+    cfg.model_config.debug = false;
+    cfg.decoding_method = Some(
+        match (model_type, hotwords.is_empty()) {
+            (SherpaModelType::Zipformer, false) => "modified_beam_search",
+            _ => "greedy_search",
+        }
+        .into(),
+    );
+    cfg.max_active_paths = 4;
+    cfg.enable_endpoint = true;
+    cfg.rule1_min_trailing_silence = rule1;
+    cfg.rule2_min_trailing_silence = rule2;
+    cfg.rule3_min_utterance_length = rule3;
+    if !hotwords.is_empty() {
+        cfg.hotwords_score = 2.0;
+        cfg.hotwords_buf = Some(hotwords.join("\n").into_bytes());
     }
-    let engine = with_stdout_suppressed(|| SherpaOnlineAsrEngine::load(cfg))
-        .with_context(|| format!("加载模型 {} 失败，目录 {:?} 是否存在", desc.name, model_dir))?;
-    let mut stream = engine.create_stream()?;
-    stream.prepare();
+
+    let recognizer = Arc::new(
+        with_stdout_suppressed(|| OnlineRecognizer::create(&cfg)).with_context(|| {
+            format!("加载模型 {} 失败，目录 {:?} 是否存在", desc.name, model_dir)
+        })?,
+    );
+    let stream = if hotwords.is_empty() {
+        recognizer.create_stream()
+    } else {
+        recognizer.create_stream_with_hotwords(&hotwords.join("\n"))
+    };
     Ok(OnlineSlot {
         name: desc.name,
-        engine,
+        recognizer,
         stream,
         partial: String::new(),
         all_partials: Vec::new(),
@@ -261,9 +351,15 @@ fn feed_online_frame(slot: &mut OnlineSlot, pcm: &[f32]) -> Option<String> {
     if !slot.enabled {
         return None;
     }
-    slot.stream.accept_waveform(pcm);
-    slot.stream.decode();
-    let next_partial = slot.stream.current_partial();
+    slot.stream.accept_waveform(VAD_SAMPLE_RATE as i32, pcm);
+    while slot.recognizer.is_ready(&slot.stream) {
+        slot.recognizer.decode(&slot.stream);
+    }
+    let next_partial = slot
+        .recognizer
+        .get_result(&slot.stream)
+        .map(|result| result.text)
+        .unwrap_or_default();
     let trimmed_partial = next_partial.trim();
     if !trimmed_partial.is_empty()
         && slot
@@ -277,8 +373,13 @@ fn feed_online_frame(slot: &mut OnlineSlot, pcm: &[f32]) -> Option<String> {
         }
     }
     slot.partial = next_partial;
-    if slot.stream.is_endpoint() {
-        let final_text = slot.stream.take_final();
+    if slot.recognizer.is_endpoint(&slot.stream) {
+        let final_text = slot
+            .recognizer
+            .get_result(&slot.stream)
+            .map(|result| result.text)
+            .unwrap_or_default();
+        slot.recognizer.reset(&slot.stream);
         slot.partial.clear();
         if !final_text.trim().is_empty() {
             slot.finals.push(final_text.clone());
@@ -292,16 +393,67 @@ fn feed_online_frame(slot: &mut OnlineSlot, pcm: &[f32]) -> Option<String> {
     None
 }
 
-// ─── 离线槽（OfflineRecognizer：Canary-180m-flash）────────────────────
-//
-// Canary 是离线模型，没有 partial / endpoint 概念。靠外部 VAD 判定句尾，
-// 把累积的音频片段一次性 decode，结果当作 final。
-//
-// 设计：每个离线槽持有一个 OfflineRecognizer，但 VAD 状态由外部 AnySlot 容器
-// 统一管理（VadState），保证多个离线槽收到完全相同的音频片段（公平对比）。
+struct OnlineModelFiles {
+    encoder: PathBuf,
+    decoder: PathBuf,
+    joiner: PathBuf,
+    tokens: PathBuf,
+}
 
-struct OfflineCanarySlot {
+fn online_model_files(
+    name: &str,
+    model_dir: &Path,
+    model_type: SherpaModelType,
+) -> Result<OnlineModelFiles> {
+    Ok(OnlineModelFiles {
+        encoder: first_existing_model_file(
+            name,
+            model_dir,
+            &["encoder.int8.onnx", "encoder.onnx"],
+        )?,
+        decoder: first_existing_model_file(
+            name,
+            model_dir,
+            match model_type {
+                SherpaModelType::NemotronStreaming => &["decoder.int8.onnx", "decoder.onnx"],
+                SherpaModelType::Zipformer => &["decoder.onnx", "decoder.int8.onnx"],
+            },
+        )?,
+        joiner: first_existing_model_file(name, model_dir, &["joiner.int8.onnx", "joiner.onnx"])?,
+        tokens: first_existing_model_file(name, model_dir, &["tokens.txt"])?,
+    })
+}
+
+fn first_existing_model_file(name: &str, model_dir: &Path, candidates: &[&str]) -> Result<PathBuf> {
+    candidates
+        .iter()
+        .map(|filename| model_dir.join(filename))
+        .find(|path| path.exists())
+        .with_context(|| {
+            format!(
+                "{} 模型文件缺失: 需要 {} 之一，目录 {}",
+                name,
+                candidates.join(" / "),
+                model_dir.display()
+            )
+        })
+}
+
+fn online_feature_dim(model_type: SherpaModelType) -> i32 {
+    match model_type {
+        SherpaModelType::NemotronStreaming => 128,
+        SherpaModelType::Zipformer => 80,
+    }
+}
+
+// ─── 离线槽（OfflineRecognizer：离线模型 + 共享 VAD）──────────────────
+//
+// 离线模型没有 partial / endpoint 概念。主循环把同一个 VAD segment 广播给
+// 所有启用的离线槽，保证 Canary / Parakeet 在完全相同的音频片段上对比。
+
+struct OfflineSlot {
     name: &'static str,
+    family: OfflineFamily,
     #[allow(dead_code)]
     recognizer: OfflineRecognizer,
     partial: String, // 离线模型恒为空，UI 显示"等待 VAD 触发"
@@ -309,69 +461,94 @@ struct OfflineCanarySlot {
     all_finals: Vec<String>,
     enabled: bool,
     finals_scroll: u16,
-    /// 正在等待解码：累积到的片段长度（用于报告统计）。
-    pending_samples: usize,
+    segments_decoded: usize,
+    last_segment_samples: usize,
 }
 
-fn build_canary_slot(desc: &ModelDesc) -> Result<OfflineCanarySlot> {
-    let dir = offline_models_dir().join(desc.subdir);
-    let encoder = dir.join("encoder.int8.onnx");
-    let decoder = dir.join("decoder.int8.onnx");
-    let tokens = dir.join("tokens.txt");
-    for (label, path) in [
-        ("encoder", &encoder),
-        ("decoder", &decoder),
-        ("tokens", &tokens),
-    ] {
-        if !path.exists() {
-            bail!(
-                "Canary 模型文件缺失: {} ({})\n\
-                 请先运行 ./scripts/download-canary.sh 下载。",
-                label,
-                path.display()
-            );
+fn build_offline_slot(desc: &ModelDesc) -> Result<OfflineSlot> {
+    let family = match desc.kind {
+        SlotKind::Offline(family) => family,
+        SlotKind::Online(_) => bail!("build_offline_slot 收到流式模型"),
+    };
+    let mut cfg = OfflineRecognizerConfig::default();
+
+    match family {
+        OfflineFamily::Canary => {
+            let encoder = require_offline_file(desc, family, "encoder", "encoder.int8.onnx")?;
+            let decoder = require_offline_file(desc, family, "decoder", "decoder.int8.onnx")?;
+            let tokens = require_offline_file(desc, family, "tokens", "tokens.txt")?;
+
+            // Canary 用 128 维 mel filterbank（sherpa-onnx 默认 80，必须显式设置）。
+            cfg.feat_config.feature_dim = 128;
+            cfg.model_config.canary.encoder = Some(encoder.to_string_lossy().into_owned());
+            cfg.model_config.canary.decoder = Some(decoder.to_string_lossy().into_owned());
+            cfg.model_config.canary.src_lang = Some("en".into());
+            cfg.model_config.canary.tgt_lang = Some("en".into());
+            cfg.model_config.canary.use_pnc = true; // 标点 + 大小写
+            cfg.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
+        }
+        OfflineFamily::ParakeetNemoCtc => {
+            let model = require_offline_file(desc, family, "model", "model.int8.onnx")?;
+            let tokens = require_offline_file(desc, family, "tokens", "tokens.txt")?;
+
+            cfg.model_config.nemo_ctc.model = Some(model.to_string_lossy().into_owned());
+            cfg.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
         }
     }
 
-    let mut cfg = OfflineRecognizerConfig::default();
-    // Canary 用 128 维 mel filterbank（sherpa-onnx 默认 80，必须显式设置）
-    cfg.feat_config.feature_dim = 128;
-    cfg.model_config.canary.encoder = Some(encoder.to_string_lossy().into_owned());
-    cfg.model_config.canary.decoder = Some(decoder.to_string_lossy().into_owned());
-    cfg.model_config.canary.src_lang = Some("en".into());
-    cfg.model_config.canary.tgt_lang = Some("en".into());
-    cfg.model_config.canary.use_pnc = true; // 标点 + 大小写
-    cfg.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
     cfg.model_config.num_threads = 1;
     cfg.model_config.provider = Some("cpu".into());
     cfg.model_config.debug = false;
 
     let recognizer = with_stdout_suppressed(|| {
-        OfflineRecognizer::create(&cfg).context("创建 Canary OfflineRecognizer 失败")
+        OfflineRecognizer::create(&cfg)
+            .with_context(|| format!("创建 {} OfflineRecognizer 失败", desc.name))
     })?;
 
-    Ok(OfflineCanarySlot {
+    Ok(OfflineSlot {
         name: desc.name,
+        family,
         recognizer,
         partial: String::new(),
         finals: Vec::new(),
         all_finals: Vec::new(),
         enabled: true,
         finals_scroll: 0,
-        pending_samples: 0,
+        segments_decoded: 0,
+        last_segment_samples: 0,
     })
 }
 
-/// 把一段已经 VAD 切好的音频喂给 Canary 解码，返回识别文本（带标点）。
-fn decode_canary_segment(slot: &mut OfflineCanarySlot, pcm: &[f32]) -> Option<String> {
-    if !slot.enabled || pcm.is_empty() {
-        slot.pending_samples = 0;
+fn require_offline_file(
+    desc: &ModelDesc,
+    family: OfflineFamily,
+    label: &str,
+    filename: &str,
+) -> Result<PathBuf> {
+    let path = offline_models_dir().join(desc.subdir).join(filename);
+    if path.exists() {
+        return Ok(path);
+    }
+    bail!(
+        "{} 模型文件缺失: {} ({})\n请先运行 {} 下载。",
+        desc.name,
+        label,
+        path.display(),
+        family.download_script()
+    );
+}
+
+/// 把一段已经 VAD 切好的音频喂给离线模型解码，返回识别文本。
+fn decode_offline_segment(slot: &mut OfflineSlot, segment: &VadSegment) -> Option<String> {
+    if !slot.enabled || segment.samples.is_empty() {
+        slot.last_segment_samples = 0;
         return None;
     }
-    slot.pending_samples = 0;
+    slot.segments_decoded += 1;
+    slot.last_segment_samples = segment.samples.len();
 
     let stream = slot.recognizer.create_stream();
-    stream.accept_waveform(16000, pcm);
+    stream.accept_waveform(VAD_SAMPLE_RATE as i32, &segment.samples);
     slot.recognizer.decode(&stream);
     let text = stream
         .get_result()
@@ -391,40 +568,305 @@ fn decode_canary_segment(slot: &mut OfflineCanarySlot, pcm: &[f32]) -> Option<St
 }
 
 // ─── VAD 状态机（离线槽共享）──────────────────────────────────────────
-//
-// 从主采集 rx 收帧后：
-//   1. 所有 Online slot 增量喂音（原有逻辑）
-//   2. 同时累积到 vad_buffer
-//   3. RMS < 阈值累计 >= VAD_SILENCE_SEC → 触发：把 vad_buffer 喂给所有 Offline slot
-//   4. 或 vad_buffer 时长 >= VAD_MAX_BUFFER_SEC → 强制触发（兜底）
+
+struct VadSegment {
+    start_sample: usize,
+    samples: Vec<f32>,
+    reason: &'static str,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum VadBackend {
+    Disabled,
+    Silero,
+    Rms,
+}
+
+impl VadBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Silero => "silero",
+            Self::Rms => "rms",
+        }
+    }
+}
 
 struct VadState {
+    inner: VadImpl,
+    total_samples_seen: usize,
+    segment_count: usize,
+    last_segment_start_sample: Option<usize>,
+    last_segment_samples: usize,
+}
+
+enum VadImpl {
+    Disabled,
+    Silero(SileroVadState),
+    Rms(RmsVadState),
+}
+
+struct SileroVadState {
+    detector: VoiceActivityDetector,
+    settings: SileroVadSettings,
+}
+
+struct SileroVadSettings {
+    model_path: PathBuf,
+    threshold: f32,
+    min_silence_sec: f32,
+    min_speech_sec: f32,
+    max_speech_sec: f32,
+}
+
+struct RmsVadState {
     buffer: Vec<f32>,
-    /// 当前是否在"说话态"。true 表示正在累积一段语音。
+    buffer_start_sample: usize,
     speaking: bool,
-    /// 连续静音的采样数。
     silence_samples: usize,
-    /// 阈值（可通过 env 覆盖）。
     rms_threshold: f32,
 }
 
 impl VadState {
-    fn new() -> Self {
-        let rms_threshold = std::env::var("VAD_RMS_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(VAD_RMS_THRESHOLD);
-        Self {
-            buffer: Vec::new(),
-            speaking: false,
-            silence_samples: 0,
-            rms_threshold,
+    fn new(has_offline_slots: bool) -> Result<Self> {
+        let inner = if !has_offline_slots {
+            VadImpl::Disabled
+        } else {
+            match std::env::var("VAD_BACKEND")
+                .unwrap_or_else(|_| "silero".to_string())
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "silero" => VadImpl::Silero(SileroVadState::new()?),
+                "rms" => VadImpl::Rms(RmsVadState::new()),
+                other => bail!("未知 VAD_BACKEND={other:?}，可用值: silero, rms"),
+            }
+        };
+        Ok(Self {
+            inner,
+            total_samples_seen: 0,
+            segment_count: 0,
+            last_segment_start_sample: None,
+            last_segment_samples: 0,
+        })
+    }
+
+    /// 喂入一帧。返回所有刚完成的 VAD segment，应广播给所有离线模型。
+    fn push(&mut self, pcm: &[f32], log: &mut Vec<String>) -> Vec<VadSegment> {
+        let frame_start_sample = self.total_samples_seen;
+        self.total_samples_seen += pcm.len();
+
+        let segments = match &mut self.inner {
+            VadImpl::Disabled => Vec::new(),
+            VadImpl::Silero(state) => state.push(pcm),
+            VadImpl::Rms(state) => state.push(pcm, frame_start_sample),
+        };
+
+        for segment in &segments {
+            self.segment_count += 1;
+            self.last_segment_start_sample = Some(segment.start_sample);
+            self.last_segment_samples = segment.samples.len();
+            push_log(
+                log,
+                format!(
+                    "[VAD/{}] segment #{} ({}) start={:.2}s len={:.2}s",
+                    self.backend().as_str(),
+                    self.segment_count,
+                    segment.reason,
+                    segment.start_sample as f32 / VAD_SAMPLE_RATE as f32,
+                    segment.samples.len() as f32 / VAD_SAMPLE_RATE as f32
+                ),
+            );
+        }
+
+        segments
+    }
+
+    fn backend(&self) -> VadBackend {
+        match &self.inner {
+            VadImpl::Disabled => VadBackend::Disabled,
+            VadImpl::Silero(_) => VadBackend::Silero,
+            VadImpl::Rms(_) => VadBackend::Rms,
         }
     }
 
-    /// 喂入一帧。返回 Some(segment) 表示 VAD 触发，应把这段喂给离线模型。
-    fn push(&mut self, pcm: &[f32], log: &mut Vec<String>) -> Option<Vec<f32>> {
+    fn status_label(&self) -> String {
+        let last = if self.last_segment_samples > 0 {
+            format!(
+                " · 最近 {:.1}s",
+                self.last_segment_samples as f32 / VAD_SAMPLE_RATE as f32
+            )
+        } else {
+            String::new()
+        };
+        match &self.inner {
+            VadImpl::Disabled => "（离线 VAD 未启用）".to_string(),
+            VadImpl::Silero(state) => {
+                let status = if state.detector.detected() {
+                    "检测中"
+                } else {
+                    "等待语音"
+                };
+                format!("（Silero·{status}{last}）")
+            }
+            VadImpl::Rms(state) => {
+                if state.speaking {
+                    format!(
+                        "（RMS·检测中 {:.1}s{last}）",
+                        state.buffer.len() as f32 / VAD_SAMPLE_RATE as f32
+                    )
+                } else {
+                    format!("（RMS·等待语音{last}）")
+                }
+            }
+        }
+    }
+
+    fn append_report(&self, out: &mut String) {
+        out.push_str("\n## VAD\n\n");
+        out.push_str(&format!("- backend: {}\n", self.backend().as_str()));
+        out.push_str(&format!("- sample_rate: {}\n", VAD_SAMPLE_RATE));
+        out.push_str(&format!("- segments: {}\n", self.segment_count));
+        if let Some(start) = self.last_segment_start_sample {
+            out.push_str(&format!(
+                "- last_segment: start={:.3}s len={:.3}s\n",
+                start as f32 / VAD_SAMPLE_RATE as f32,
+                self.last_segment_samples as f32 / VAD_SAMPLE_RATE as f32
+            ));
+        }
+        match &self.inner {
+            VadImpl::Disabled => {}
+            VadImpl::Silero(state) => {
+                out.push_str(&format!(
+                    "- silero_model: {}\n",
+                    state.settings.model_path.display()
+                ));
+                out.push_str(&format!(
+                    "- silero_threshold: {}\n",
+                    state.settings.threshold
+                ));
+                out.push_str(&format!(
+                    "- silero_min_silence_sec: {}\n",
+                    state.settings.min_silence_sec
+                ));
+                out.push_str(&format!(
+                    "- silero_min_speech_sec: {}\n",
+                    state.settings.min_speech_sec
+                ));
+                out.push_str(&format!(
+                    "- silero_max_speech_sec: {}\n",
+                    state.settings.max_speech_sec
+                ));
+                out.push_str(&format!(
+                    "- silero_window_size: {}\n",
+                    SILERO_VAD_WINDOW_SIZE
+                ));
+                out.push_str(&format!("- silero_buffer_sec: {}\n", SILERO_VAD_BUFFER_SEC));
+            }
+            VadImpl::Rms(state) => {
+                out.push_str(&format!("- rms_threshold: {}\n", state.rms_threshold));
+                out.push_str(&format!("- rms_silence_sec: {}\n", VAD_SILENCE_SEC));
+                out.push_str(&format!("- rms_max_buffer_sec: {}\n", VAD_MAX_BUFFER_SEC));
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        match &mut self.inner {
+            VadImpl::Disabled => {}
+            VadImpl::Silero(state) => {
+                state.detector.clear();
+                state.detector.reset();
+            }
+            VadImpl::Rms(state) => state.reset(),
+        }
+        self.total_samples_seen = 0;
+        self.segment_count = 0;
+        self.last_segment_start_sample = None;
+        self.last_segment_samples = 0;
+    }
+}
+
+impl SileroVadState {
+    fn new() -> Result<Self> {
+        let settings = SileroVadSettings::from_env();
+        if !settings.model_path.exists() {
+            bail!(
+                "Silero VAD 模型文件缺失: {}\n请先运行 ./scripts/download-silero-vad.sh 下载，或用 SILERO_VAD_MODEL 指定路径。",
+                settings.model_path.display()
+            );
+        }
+        let cfg = VadModelConfig {
+            silero_vad: SileroVadModelConfig {
+                model: Some(settings.model_path.to_string_lossy().into_owned()),
+                threshold: settings.threshold,
+                min_silence_duration: settings.min_silence_sec,
+                min_speech_duration: settings.min_speech_sec,
+                window_size: SILERO_VAD_WINDOW_SIZE,
+                max_speech_duration: settings.max_speech_sec,
+            },
+            ten_vad: Default::default(),
+            sample_rate: VAD_SAMPLE_RATE as i32,
+            num_threads: 1,
+            provider: Some("cpu".into()),
+            debug: false,
+        };
+        let detector = with_stdout_suppressed(|| {
+            VoiceActivityDetector::create(&cfg, SILERO_VAD_BUFFER_SEC)
+                .context("创建 Silero VoiceActivityDetector 失败")
+        })?;
+        Ok(Self { detector, settings })
+    }
+
+    fn push(&mut self, pcm: &[f32]) -> Vec<VadSegment> {
+        self.detector.accept_waveform(pcm);
+        let mut segments = Vec::new();
+        while let Some(front) = self.detector.front() {
+            let start_sample = front.start().max(0) as usize;
+            let samples = front.samples().to_vec();
+            drop(front);
+            self.detector.pop();
+            if !samples.is_empty() {
+                segments.push(VadSegment {
+                    start_sample,
+                    samples,
+                    reason: "speech",
+                });
+            }
+        }
+        segments
+    }
+}
+
+impl SileroVadSettings {
+    fn from_env() -> Self {
+        Self {
+            model_path: silero_vad_model_path(),
+            threshold: env_f32("SILERO_VAD_THRESHOLD", SILERO_VAD_THRESHOLD),
+            min_silence_sec: env_f32("SILERO_VAD_MIN_SILENCE_SEC", SILERO_VAD_MIN_SILENCE_SEC),
+            min_speech_sec: env_f32("SILERO_VAD_MIN_SPEECH_SEC", SILERO_VAD_MIN_SPEECH_SEC),
+            max_speech_sec: env_f32("SILERO_VAD_MAX_SPEECH_SEC", SILERO_VAD_MAX_SPEECH_SEC),
+        }
+    }
+}
+
+impl RmsVadState {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            buffer_start_sample: 0,
+            speaking: false,
+            silence_samples: 0,
+            rms_threshold: env_f32("VAD_RMS_THRESHOLD", VAD_RMS_THRESHOLD),
+        }
+    }
+
+    fn push(&mut self, pcm: &[f32], frame_start_sample: usize) -> Vec<VadSegment> {
         let frame_rms = rms(pcm);
+        if self.buffer.is_empty() {
+            self.buffer_start_sample = frame_start_sample;
+        }
         self.buffer.extend_from_slice(pcm);
 
         let now_speaking = frame_rms >= self.rms_threshold;
@@ -435,8 +877,8 @@ impl VadState {
             self.silence_samples += pcm.len();
         }
 
-        let silence_limit = (VAD_SILENCE_SEC * 16000.0) as usize;
-        let buffer_limit = (VAD_MAX_BUFFER_SEC * 16000.0) as usize;
+        let silence_limit = (VAD_SILENCE_SEC * VAD_SAMPLE_RATE as f32) as usize;
+        let buffer_limit = (VAD_MAX_BUFFER_SEC * VAD_SAMPLE_RATE as f32) as usize;
 
         // 触发条件 1：说话后静音超过 silence_limit
         let silence_triggered = self.speaking && self.silence_samples >= silence_limit;
@@ -445,30 +887,30 @@ impl VadState {
 
         if silence_triggered || force_triggered {
             if self.buffer.is_empty() {
-                return None;
+                return Vec::new();
             }
             let reason = if force_triggered {
                 "max-buffer"
             } else {
                 "silence"
             };
-            let secs = self.buffer.len() as f32 / 16000.0;
-            if log.len() < 200 {
-                log.push(format!(
-                    "[VAD] 触发({reason}): {secs:.1}s 缓冲, rms={frame_rms:.4}"
-                ));
-            }
+            let start_sample = self.buffer_start_sample;
             let segment = std::mem::take(&mut self.buffer);
             self.speaking = false;
             self.silence_samples = 0;
-            Some(segment)
+            vec![VadSegment {
+                start_sample,
+                samples: segment,
+                reason,
+            }]
         } else {
-            None
+            Vec::new()
         }
     }
 
     fn reset(&mut self) {
         self.buffer.clear();
+        self.buffer_start_sample = 0;
         self.speaking = false;
         self.silence_samples = 0;
     }
@@ -478,14 +920,14 @@ impl VadState {
 
 enum AnySlot {
     Online(OnlineSlot),
-    OfflineCanary(OfflineCanarySlot),
+    Offline(OfflineSlot),
 }
 
 impl AnySlot {
     fn name(&self) -> &str {
         match self {
             AnySlot::Online(s) => s.name,
-            AnySlot::OfflineCanary(s) => s.name,
+            AnySlot::Offline(s) => s.name,
         }
     }
 
@@ -496,7 +938,7 @@ impl AnySlot {
     fn build(desc: &ModelDesc) -> Result<Self> {
         match desc.kind {
             SlotKind::Online(_) => Ok(Self::Online(build_online_slot(desc)?)),
-            SlotKind::OfflineCanary => Ok(Self::OfflineCanary(build_canary_slot(desc)?)),
+            SlotKind::Offline(_) => Ok(Self::Offline(build_offline_slot(desc)?)),
         }
     }
 }
@@ -513,42 +955,6 @@ trait SlotView {
     fn clear(&mut self);
 }
 
-macro_rules! impl_slot_view {
-    ($ty:ty) => {
-        impl SlotView for $ty {
-            fn partial(&self) -> &str {
-                &self.partial
-            }
-            fn finals(&self) -> &[String] {
-                &self.finals
-            }
-            fn all_finals(&self) -> &[String] {
-                &self.all_finals
-            }
-            fn enabled(&self) -> bool {
-                self.enabled
-            }
-            fn finals_scroll(&self) -> u16 {
-                self.finals_scroll
-            }
-            fn finals_scroll_mut(&mut self) -> &mut u16 {
-                &mut self.finals_scroll
-            }
-            fn set_enabled(&mut self, enabled: bool) {
-                self.enabled = enabled;
-                if !enabled {
-                    self.partial.clear();
-                }
-            }
-            fn clear(&mut self) {
-                self.partial.clear();
-                self.finals.clear();
-                self.all_finals.clear();
-                self.finals_scroll = 0;
-            }
-        }
-    };
-}
 impl SlotView for OnlineSlot {
     fn partial(&self) -> &str {
         &self.partial
@@ -582,55 +988,89 @@ impl SlotView for OnlineSlot {
         self.finals_scroll = 0;
     }
 }
-impl_slot_view!(OfflineCanarySlot);
+
+impl SlotView for OfflineSlot {
+    fn partial(&self) -> &str {
+        &self.partial
+    }
+    fn finals(&self) -> &[String] {
+        &self.finals
+    }
+    fn all_finals(&self) -> &[String] {
+        &self.all_finals
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn finals_scroll(&self) -> u16 {
+        self.finals_scroll
+    }
+    fn finals_scroll_mut(&mut self) -> &mut u16 {
+        &mut self.finals_scroll
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.partial.clear();
+        }
+    }
+    fn clear(&mut self) {
+        self.partial.clear();
+        self.finals.clear();
+        self.all_finals.clear();
+        self.finals_scroll = 0;
+        self.segments_decoded = 0;
+        self.last_segment_samples = 0;
+    }
+}
 
 impl SlotView for AnySlot {
     fn partial(&self) -> &str {
         match self {
             AnySlot::Online(s) => s.partial(),
-            AnySlot::OfflineCanary(s) => s.partial(),
+            AnySlot::Offline(s) => s.partial(),
         }
     }
     fn finals(&self) -> &[String] {
         match self {
             AnySlot::Online(s) => s.finals(),
-            AnySlot::OfflineCanary(s) => s.finals(),
+            AnySlot::Offline(s) => s.finals(),
         }
     }
     fn all_finals(&self) -> &[String] {
         match self {
             AnySlot::Online(s) => s.all_finals(),
-            AnySlot::OfflineCanary(s) => s.all_finals(),
+            AnySlot::Offline(s) => s.all_finals(),
         }
     }
     fn enabled(&self) -> bool {
         match self {
             AnySlot::Online(s) => s.enabled(),
-            AnySlot::OfflineCanary(s) => s.enabled(),
+            AnySlot::Offline(s) => s.enabled(),
         }
     }
     fn finals_scroll(&self) -> u16 {
         match self {
             AnySlot::Online(s) => s.finals_scroll(),
-            AnySlot::OfflineCanary(s) => s.finals_scroll(),
+            AnySlot::Offline(s) => s.finals_scroll(),
         }
     }
     fn finals_scroll_mut(&mut self) -> &mut u16 {
         match self {
             AnySlot::Online(s) => s.finals_scroll_mut(),
-            AnySlot::OfflineCanary(s) => s.finals_scroll_mut(),
+            AnySlot::Offline(s) => s.finals_scroll_mut(),
         }
     }
     fn set_enabled(&mut self, enabled: bool) {
         match self {
             AnySlot::Online(s) => s.set_enabled(enabled),
-            AnySlot::OfflineCanary(s) => s.set_enabled(enabled),
+            AnySlot::Offline(s) => s.set_enabled(enabled),
         }
     }
     fn clear(&mut self) {
         match self {
             AnySlot::Online(s) => s.clear(),
-            AnySlot::OfflineCanary(s) => s.clear(),
+            AnySlot::Offline(s) => s.clear(),
         }
     }
 }
@@ -996,6 +1436,8 @@ fn export_report(app: &App) -> Result<PathBuf> {
         }
     }
 
+    app.vad.append_report(&mut out);
+
     out.push_str("\n## ASR Results\n");
     for slot in &app.slots {
         out.push_str(&format!("\n### {}\n\n", slot.name()));
@@ -1014,6 +1456,17 @@ fn export_report(app: &App) -> Result<PathBuf> {
                 }
                 out.push('\n');
             }
+        }
+        if let AnySlot::Offline(s) = slot {
+            out.push_str(&format!("- family: {}\n", s.family.as_str()));
+            out.push_str(&format!("- decoded_segments: {}\n", s.segments_decoded));
+            if s.last_segment_samples > 0 {
+                out.push_str(&format!(
+                    "- last_decoded_segment_sec: {:.3}\n",
+                    s.last_segment_samples as f32 / VAD_SAMPLE_RATE as f32
+                ));
+            }
+            out.push('\n');
         }
         if slot.all_finals().is_empty() {
             out.push_str("finals: <none>\n");
@@ -1151,7 +1604,14 @@ fn run_selection_screen(
     // 每个模型是否就绪：流式模型恒 true，离线模型检测文件是否齐全。
     // 不就绪的模型在选择屏打灰、不可勾选（优雅降级）。
     let available: Vec<bool> = MODEL_DESCS.iter().map(|d| d.files_present()).collect();
-    let mut selected: Vec<bool> = available.iter().map(|&ok| ok).collect();
+    let mut selected: Vec<bool> = MODEL_DESCS
+        .iter()
+        .enumerate()
+        .map(|(i, desc)| available[i] && matches!(desc.kind, SlotKind::Offline(_)))
+        .collect();
+    if !selected.iter().any(|&s| s) {
+        selected = available.clone();
+    }
 
     loop {
         terminal.draw(|frame| {
@@ -1188,7 +1648,7 @@ fn run_selection_screen(
                 };
                 let kind_tag = match desc.kind {
                     SlotKind::Online(_) => "流式",
-                    SlotKind::OfflineCanary => "离线+VAD",
+                    SlotKind::Offline(_) => "离线+VAD",
                 };
                 let style = if !ok {
                     Style::default().fg(Color::DarkGray)
@@ -1203,21 +1663,23 @@ fn run_selection_screen(
                     Span::raw(format!(" {} ", i + 1))
                 };
                 let suffix = if !ok {
-                    "  (未下载: ./scripts/download-canary.sh)"
+                    desc.missing_files_hint()
+                        .map(|script| format!("  (未下载: {script})"))
+                        .unwrap_or_default()
                 } else {
-                    ""
+                    String::new()
                 };
                 lines.push(Line::from(vec![
                     key_span,
                     Span::styled(
-                        format!("{check}{} ({lang}/{kind_tag}){suffix}", desc.name),
+                        format!("{check}{} ({lang}/{kind_tag}){}", desc.name, suffix),
                         style,
                     ),
                 ]));
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                " 按数字键切换勾选 · Enter 确认 · q 退出 ",
+                " 默认只勾选离线模型 · 可手动加入流式模型混跑 · Enter 确认 · q 退出 ",
                 Style::default().fg(Color::DarkGray),
             )));
             let list = Paragraph::new(lines)
@@ -1624,6 +2086,8 @@ fn main() -> Result<()> {
     for &i in &indices {
         slots.push(AnySlot::build(&MODEL_DESCS[i])?);
     }
+    let has_offline_slots = slots.iter().any(|slot| !slot.is_online());
+    let vad = VadState::new(has_offline_slots)?;
 
     // 阶段 3 + 4：设备选择 → 预览。两屏之间可往返（预览 Esc 回设备选择）。
     let (mut rx, source_label) = loop {
@@ -1650,7 +2114,7 @@ fn main() -> Result<()> {
     let media = MediaState::load_default()?;
     let mut app = App {
         slots,
-        vad: VadState::new(),
+        vad,
         log: Vec::new(),
         last_rms: 0.0,
         started_at: Instant::now(),
@@ -1698,23 +2162,17 @@ fn run_loop(
             for slot in &mut app.slots {
                 if let AnySlot::Online(s) = slot {
                     if let Some(final_text) = feed_online_frame(s, &frame) {
-                        app.log.push(format!("[{}] final: {}", s.name, final_text));
-                        if app.log.len() > 200 {
-                            app.log.remove(0);
-                        }
+                        push_log(&mut app.log, format!("[{}] final: {}", s.name, final_text));
                     }
                 }
             }
 
             // 2) 离线槽：喂 VAD 状态机；触发时把整段广播给所有离线槽。
-            if let Some(segment) = app.vad.push(&frame, &mut app.log) {
+            for segment in app.vad.push(&frame, &mut app.log) {
                 for slot in &mut app.slots {
-                    if let AnySlot::OfflineCanary(s) = slot {
-                        if let Some(final_text) = decode_canary_segment(s, &segment) {
-                            app.log.push(format!("[{}] final: {}", s.name, final_text));
-                            if app.log.len() > 200 {
-                                app.log.remove(0);
-                            }
+                    if let AnySlot::Offline(s) = slot {
+                        if let Some(final_text) = decode_offline_segment(s, &segment) {
+                            push_log(&mut app.log, format!("[{}] final: {}", s.name, final_text));
                         }
                     }
                 }
@@ -1771,6 +2229,13 @@ fn humantime_elapsed(start: Instant) -> String {
     format!("{}分{}秒", s / 60, s % 60)
 }
 
+fn push_log(log: &mut Vec<String>, message: impl Into<String>) {
+    log.push(message.into());
+    if log.len() > 200 {
+        log.remove(0);
+    }
+}
+
 // ─── 渲染 ─────────────────────────────────────────────────────────────
 
 fn draw(app: &mut App, frame: &mut ratatui::Frame) {
@@ -1800,7 +2265,7 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
         Span::raw(" 退出 · "),
         Span::styled("c", Style::default().fg(Color::Yellow)),
         Span::raw(" 清空 · "),
-        Span::styled("1/2/3", Style::default().fg(Color::Yellow)),
+        Span::styled("1-9", Style::default().fg(Color::Yellow)),
         Span::raw(" 切换引擎 · "),
         Span::raw(format!("音频 RMS {:.4}", app.last_rms)),
         Span::raw(" · 源:"),
@@ -1843,13 +2308,7 @@ fn draw(app: &mut App, frame: &mut ratatui::Frame) {
         let partial_label: String = if dim {
             "[已关闭]".to_string()
         } else if is_offline {
-            // 离线槽没有 partial，显示 VAD 缓冲长度提示
-            let secs = app.vad.buffer.len() as f32 / 16000.0;
-            if app.vad.speaking {
-                format!("（离线·录音中 {secs:.1}s，VAD 触发后出结果）")
-            } else {
-                "（离线·等待说话触发 VAD）".to_string()
-            }
+            app.vad.status_label()
         } else {
             slot.partial().to_string()
         };
