@@ -257,6 +257,7 @@ pub(crate) fn feed_online_frame(slot: &mut OnlineSlot, pcm: &[f32]) -> Option<St
 fn apply_segment_action(slot: &mut OnlineSlot, action: SegmentAction) -> Option<String> {
     match action {
         SegmentAction::Checkpoint { text, draft } => {
+            // Checkpoint 不重建流（保留声学上下文），text 已是增量文本
             slot.partial = draft;
             if text.trim().is_empty() {
                 return None;

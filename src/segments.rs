@@ -25,7 +25,8 @@ pub(crate) struct SegConfig {
     // 句末标点切句
     pub(crate) punct_stability_sec: f32,
     pub(crate) punct_cooldown_sec: f32,
-    pub(crate) punct_min_new_words: usize,
+    /// 增量字数不足时不切（防止短句碎片，如"好的。"、"是的。"）
+    pub(crate) punct_min_words: usize,
 
     // 无标点兜底
     pub(crate) no_punct_timeout_sec: f32,
@@ -51,24 +52,27 @@ const SENTENCE_ENDINGS: &[char] = &['.', '?', '!'];
 
 pub(crate) const SEG_CONFIG_ENHANCED_ZIPFORMER_EN: SegConfig = SegConfig {
     name: "加强版Zipformer-en",
-    vad_min_silence_sec: 0.3,
+    // VAD 收尾：人停 1.2s 才触发（只做最后一截的提交）
+    vad_min_silence_sec: 1.2,
     vad_threshold: 0.5,
     vad_max_speech_sec: 18.0,
+    // 标点切句：主力，稳定的句末标点 → 提交增量文本（不重建流）
     punct_stability_sec: 0.7,
     punct_cooldown_sec: 1.5,
-    punct_min_new_words: 3,
-    no_punct_timeout_sec: 10.0,
-    no_punct_stability_sec: 1.0,
-    no_punct_min_words: 12,
-    no_punct_keep_last_words: 3,
-    extreme_timeout_sec: 25.0,
+    punct_min_words: 4,
+    // 以下兜底设为极大值，实际由 VAD 收尾（而非超时兜底）负责
+    no_punct_timeout_sec: 600.0,
+    no_punct_stability_sec: 0.0,
+    no_punct_min_words: 0,
+    no_punct_keep_last_words: 0,
+    extreme_timeout_sec: 600.0,
 };
 
 // ─── 切句动作 ────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub(crate) enum SegmentAction {
-    /// Checkpoint 切句：提交 `text`，不重建 stream。`draft` 是剩余草稿。
+    /// Checkpoint 切句：提交 `text` 后重建 stream。`draft` 是剩余草稿（当前已闲置，保留仅供扩展）。
     Checkpoint { text: String, draft: String },
     /// VAD 检测到静音：提交尾巴 `text`，需要重置 stream。
     VadReset { text: String },
@@ -162,8 +166,10 @@ pub(crate) struct Segmenter {
     no_punct_stable_since: Option<(Instant, String)>,
 
     // ── 已提交前缀 ──
-    /// 最近一次切句提交的文本（用于计算 draft，避免重复）
+    /// 最近一次切句提交的完整前缀（用于计算 delta）
     committed_text: String,
+    /// 已提交前缀的词数（ASR 修订时用词数跳过兜底）
+    committed_word_count: usize,
 
     // ── 统计 ──
     pub(crate) stats: SegStats,
@@ -180,6 +186,7 @@ impl Segmenter {
             punct_candidate: None,
             no_punct_stable_since: None,
             committed_text: String::new(),
+            committed_word_count: 0,
             stats: SegStats::default(),
         }
     }
@@ -247,6 +254,7 @@ impl Segmenter {
         self.punct_candidate = None;
         self.no_punct_stable_since = None;
         self.committed_text.clear();
+        self.committed_word_count = 0;
     }
 
     /// 当前草稿文本 = 完整 partial - 已提交前缀。
@@ -324,20 +332,24 @@ impl Segmenter {
             }
         }
 
-        // 检查最小新增长度（3 个英文词）
-        let cut_pos = punct_pos + punct_char.len_utf8(); // 切到标点之后（含标点）
+        // 切点：句末标点之后（含标点）
+        let cut_pos = punct_pos + punct_char.len_utf8();
+
+        // 增量不足 min_words 时不切（防止"好的。"、"是的。"等短句触发切句）
         let after_committed = if partial.starts_with(&self.committed_text) {
             &partial[self.committed_text.len()..]
         } else {
-            // ASR 修订了已提交前缀：反悔
-            self.stats.punct_regret_count += 1;
-            self.punct_candidate = None;
-            self.committed_text.clear();
             partial
         };
-        let new_part = &after_committed[..cut_pos.saturating_sub(self.committed_text.len()).min(after_committed.len())];
-        let new_word_count = new_part.split_whitespace().count();
-        if new_word_count < self.config.punct_min_new_words {
+        let new_section_end = cut_pos
+            .saturating_sub(self.committed_text.len())
+            .min(after_committed.len());
+        if after_committed[..new_section_end]
+            .split_whitespace()
+            .count()
+            < self.config.punct_min_words
+        {
+            self.punct_candidate = None;
             return None;
         }
 
@@ -376,17 +388,21 @@ impl Segmenter {
         }
 
         // 稳定！执行 checkpoint 切句
-        let text = partial[..cut_pos].to_string();
+        let full_prefix = partial[..cut_pos].to_string();
         let draft = partial[cut_pos..].trim().to_string();
         let latency_ms = (now - candidate.first_seen).as_millis() as u64;
+
+        // 只提交增量文本（已提交过的内容不重复提交）
+        let text = self.compute_delta(&full_prefix);
 
         self.stats.punct_success_count += 1;
         self.stats.total_cut_latency_ms += latency_ms;
         self.record_segment(&text, true);
         self.last_cut = Some(now);
-        self.last_nonempty_partial = Some(now); // #fix: 重置计时基线，避免极端兜底误触发
+        self.last_nonempty_partial = Some(now);
         self.punct_candidate = None;
-        self.committed_text = text.clone();
+        self.committed_text = full_prefix;
+        self.committed_word_count = self.committed_text.split_whitespace().count();
 
         Some(SegmentAction::Checkpoint { text, draft })
     }
@@ -486,6 +502,31 @@ impl Segmenter {
         }
     }
 
+    /// 计算自上次 checkpoint 以来的增量文本（避免重复提交）。
+    fn compute_delta(&self, full_prefix: &str) -> String {
+        if self.committed_text.is_empty() {
+            return full_prefix.to_string();
+        }
+        if full_prefix.starts_with(&self.committed_text) {
+            let delta = &full_prefix[self.committed_text.len()..];
+            Self::trim_delta(delta)
+        } else {
+            // ASR 修订：按词数跳过
+            Self::trim_delta(suffix_after_word_count(
+                full_prefix,
+                self.committed_word_count,
+            ))
+        }
+    }
+
+    /// 去掉 delta 首尾的标点和空白，使 final 片段干净。
+    fn trim_delta(delta: &str) -> String {
+        delta
+            .trim_start_matches(|c: char| c == '.' || c == '?' || c == '!' || c == ' ')
+            .trim()
+            .to_string()
+    }
+
     /// 检查文本是否以连接词结尾。
     fn ends_with_connection_word(text: &str) -> bool {
         let last_word = text
@@ -542,6 +583,38 @@ impl Segmenter {
     }
 }
 
+/// 按词数跳过已提交前缀：`text` 跳过前 `word_count` 个词后的剩余部分。
+/// 用于 ASR 修订导致前缀匹配失败时的兜底。
+fn suffix_after_word_count(text: &str, word_count: usize) -> &str {
+    let text = text.trim();
+    if word_count == 0 {
+        return text;
+    }
+    let mut seen = 0usize;
+    let mut in_word = false;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if in_word {
+                seen += 1;
+                if seen == word_count {
+                    return text[idx..].trim();
+                }
+                in_word = false;
+            }
+        } else {
+            in_word = true;
+        }
+    }
+    if in_word {
+        seen += 1;
+    }
+    if seen <= word_count {
+        ""
+    } else {
+        text
+    }
+}
+
 // ─── 测试 ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -553,8 +626,24 @@ mod tests {
         Instant::now()
     }
 
+    /// 测试专用配置：快速触发器，避免等太久。
+    const TEST_CONFIG: SegConfig = SegConfig {
+        name: "test",
+        vad_min_silence_sec: 0.3,
+        vad_threshold: 0.5,
+        vad_max_speech_sec: 18.0,
+        punct_stability_sec: 0.7,
+        punct_cooldown_sec: 1.5,
+        punct_min_words: 1,
+        no_punct_timeout_sec: 10.0,
+        no_punct_stability_sec: 1.0,
+        no_punct_min_words: 12,
+        no_punct_keep_last_words: 3,
+        extreme_timeout_sec: 25.0,
+    };
+
     fn make_seg() -> Segmenter {
-        Segmenter::new(SEG_CONFIG_ENHANCED_ZIPFORMER_EN.clone(), now())
+        Segmenter::new(TEST_CONFIG.clone(), now())
     }
 
     fn advance(base: Instant, secs: f32) -> Instant {
