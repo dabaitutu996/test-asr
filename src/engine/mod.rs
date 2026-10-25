@@ -29,7 +29,10 @@ impl AnySlot {
         matches!(self, AnySlot::Online(_))
     }
 
-    pub(crate) fn build_with_config(desc: &ModelDesc, seg_config: Option<&crate::segments::SegConfig>) -> Result<Self> {
+    pub(crate) fn build_with_config(
+        desc: &ModelDesc,
+        seg_config: Option<&crate::segments::SegConfig>,
+    ) -> Result<Self> {
         match desc.kind {
             SlotKind::Online(_) => Ok(Self::Online(build_online_slot(desc, seg_config)?)),
             SlotKind::Offline(_) => Ok(Self::Offline(build_offline_slot(desc)?)),

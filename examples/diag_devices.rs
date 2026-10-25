@@ -1,150 +1,113 @@
-//! 诊断工具：dump 三个来源的设备列表，并对每个输出设备实采 2 秒看有没有数据。
+//! 设备诊断示例（Linux）：列出麦克风（PulseAudio sources）与系统音频
+//! （monitor source），可选对每个 source 做 2 秒实测采集，打印帧数与 RMS。
 //!
-//! 运行：cargo run --example diag_devices
+//! 用法：
+//! ```text
+//! cargo run --example diag_devices               # 只列设备
+//! cargo run --example diag_devices -- --capture  # 列表 + 逐个实测 2 秒
+//! ```
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use asr_compare_tui::system_audio;
-use cpal::traits::{DeviceTrait, HostTrait};
+use anyhow::Result;
+use asr_compare_tui::system_audio::{self, AudioDevice};
 
-fn main() {
-    println!("========== cpal INPUT devices ==========");
-    let host = cpal::default_host();
-    let cpal_inputs: Vec<String> = host
-        .input_devices()
-        .map(|d| d.filter_map(|x| x.name().ok()).collect())
-        .unwrap_or_default();
-    for n in &cpal_inputs {
-        println!("  INPUT  name={n:?}");
+const CAPTURE_SECONDS: u64 = 2;
+
+fn main() -> Result<()> {
+    let capture = std::env::args().any(|arg| arg == "--capture");
+
+    println!("========== 输入端（pactl list sources） ==========");
+    let inputs = system_audio::list_input_devices().unwrap_or_else(|err| {
+        println!("  枚举失败: {err}");
+        Vec::new()
+    });
+    if inputs.is_empty() {
+        println!("  （无输入设备：确认 PulseAudio/PipeWire 正在运行，且已安装 pulseaudio-utils）");
+    }
+    for device in &inputs {
+        println!("  [{}] {} -> {}", device.id, device.name, device.uid);
     }
 
-    println!("\n========== cpal OUTPUT devices ==========");
-    let cpal_outputs: Vec<String> = host
-        .output_devices()
-        .map(|d| d.filter_map(|x| x.name().ok()).collect())
-        .unwrap_or_default();
-    for n in &cpal_outputs {
-        println!("  OUTPUT name={n:?}");
+    println!("\n========== 输出端（pactl list sinks → monitor source） ==========");
+    let outputs = system_audio::list_output_devices().unwrap_or_else(|err| {
+        println!("  枚举失败: {err}");
+        Vec::new()
+    });
+    if outputs.is_empty() {
+        println!("  （无输出设备：确认 PulseAudio/PipeWire 正在运行，且已安装 pulseaudio-utils）");
+    }
+    for device in &outputs {
+        println!("  [{}] {} -> {}", device.id, device.name, device.uid);
     }
 
-    println!("\n========== system_audio::list_output_devices (raw) ==========");
-    let raw = match system_audio::list_output_devices() {
-        Ok(v) => v,
-        Err(e) => {
-            println!("  ERROR: {e}");
-            Vec::new()
-        }
-    };
-    for d in &raw {
-        println!("  name={:?} uid={:?}", d.name, d.uid);
+    if !capture {
+        println!("\n提示：加 --capture 可对每个设备实测 2 秒采集。");
+        return Ok(());
     }
 
-    println!("\n========== 白名单匹配情况 ==========");
-    for d in &raw {
-        let hit = cpal_outputs.iter().any(|w| w == &d.name);
-        println!("  {} name={:?}", if hit { "KEEP" } else { "DROP" }, d.name);
+    println!("\n========== 实测采集（每设备 {CAPTURE_SECONDS}s） ==========");
+    for device in inputs.iter().chain(outputs.iter()) {
+        measure(device);
     }
 
-    println!("\n========== 对照采集：先测默认设备（None），再逐个测指定 UID ==========");
-    println!("⚠️  Process Tap 只采集「别的 App 播放的声音」，本工具自己不发声。");
-    println!("    请现在打开音乐/视频/浏览器并播放（系统默认输出设备即可）！");
-    println!("    按回车开始采集...");
-    let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
-
-    let mut any_frames = false;
-
-    println!("\n--- [对照] 默认输出设备（传 None，engine 原版用法） ---");
-    any_frames |= test_capture_default() > 0;
-
-    for d in &raw {
-        println!("\n--- 指定 UID: {} ({}) ---", d.uid, d.name);
-        any_frames |= test_capture(&d.name, &d.uid) > 0;
-    }
-
-    if !any_frames {
-        println!("\n⚠️ 所有对照采集都保持 0 帧。");
-        println!("   这通常不是 `Some(uid)` / `None` 或设备枚举差异，而是 macOS TCC 在宿主 App 层拒绝了系统音频录制。");
-        println!("   若你是从终端 `cargo run` 启动，常见原因是终端宿主（例如 Warp）没有 `NSAudioCaptureUsageDescription`，");
-        println!(
-            "   TCC 会拒绝 `kTCCServiceAudioCapture`，但 Rust 侧仍可能拿到 `start() -> Ok(...)`。"
-        );
-        println!("   可用下面的命令核对最近日志：");
-        println!("   /usr/bin/log show --last 10m --predicate 'subsystem == \"com.apple.TCC\"' | rg 'kTCCServiceAudioCapture|NSAudioCaptureUsageDescription'");
-        println!("   如果看到 `Refusing authorization request ... without NSAudioCaptureUsageDescription key`，");
-        println!(
-            "   请改用带该 Info.plist 键的 .app 宿主运行，或直接用已有的 Tauri App bundle 调试。"
-        );
-    }
-
-    println!("\n========== 完成 ==========");
+    Ok(())
 }
 
-fn test_capture_default() -> usize {
+fn measure(device: &AudioDevice) {
     let stop = Arc::new(AtomicBool::new(false));
     let rebuild = Arc::new(AtomicBool::new(false));
-    let mut rx = match system_audio::start(stop.clone(), rebuild, None) {
-        Ok((_tap, rx)) => rx,
-        Err(e) => {
-            println!("  启动失败: {e}");
-            return 0;
-        }
-    };
-    println!("  开始采集 6 秒...");
-    capture_loop("默认设备", &mut rx, &stop)
-}
+    let started = Instant::now();
 
-fn capture_loop(
-    label: &str,
-    rx: &mut tokio::sync::mpsc::Receiver<Vec<f32>>,
-    stop: &Arc<AtomicBool>,
-) -> usize {
+    let (tap, mut rx) =
+        match system_audio::start_source(stop.clone(), rebuild.clone(), device.uid.as_str()) {
+            Ok(pair) => pair,
+            Err(err) => {
+                println!("  [{}] 启动失败: {err:#}", device.name);
+                return;
+            }
+        };
+
+    let deadline = started + Duration::from_secs(CAPTURE_SECONDS);
     let mut frames = 0usize;
-    let mut max_rms = 0.0f32;
-    for sec in 1..=6 {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
-            while let Ok(buf) = rx.try_recv() {
+    let mut samples = 0usize;
+    let mut sum_squares = 0f64;
+    while Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(frame) => {
                 frames += 1;
-                let r = rms(&buf);
-                if r > max_rms {
-                    max_rms = r;
-                }
+                samples += frame.len();
+                sum_squares += frame
+                    .iter()
+                    .map(|sample| (*sample as f64) * (*sample as f64))
+                    .sum::<f64>();
             }
-            std::thread::sleep(Duration::from_millis(20));
+            Err(_) => thread::sleep(Duration::from_millis(20)),
         }
-        println!(
-            "    [{label}] {sec}s: frames={frames} max_rms={max_rms:.4}{}",
-            if max_rms > 0.001 {
-                "  <-- 有声音!"
-            } else {
-                ""
-            }
-        );
     }
-    stop.store(true, std::sync::atomic::Ordering::Release);
-    frames
-}
+    stop.store(true, Ordering::Release);
+    drop(tap);
 
-fn test_capture(name: &str, uid: &str) -> usize {
-    let stop = Arc::new(AtomicBool::new(false));
-    let rebuild = Arc::new(AtomicBool::new(false));
-    let mut rx = match system_audio::start(stop.clone(), rebuild, Some(uid)) {
-        Ok((_tap, rx)) => rx,
-        Err(e) => {
-            println!("  [{name:?}] 启动失败: {e}");
-            return 0;
-        }
+    let rms = if samples == 0 {
+        0.0
+    } else {
+        (sum_squares / samples as f64).sqrt()
     };
-    capture_loop(name, &mut rx, &stop)
-}
-
-fn rms(s: &[f32]) -> f32 {
-    if s.is_empty() {
-        return 0.0;
+    let verdict = if frames == 0 {
+        "无数据（设备空闲？）"
+    } else if rms < 1e-4 {
+        "有数据但接近静音"
+    } else {
+        "采集正常"
+    };
+    println!(
+        "  [{}] 帧数={frames} 样本={samples} RMS={rms:.5} -> {verdict}",
+        device.name
+    );
+    if rebuild.load(Ordering::Acquire) {
+        println!("     (parec 中途退出，已置位重建标记)");
     }
-    let sum = s.iter().map(|x| x * x).sum::<f32>();
-    (sum / s.len() as f32).sqrt()
 }

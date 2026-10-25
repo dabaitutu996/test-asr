@@ -60,26 +60,30 @@ pub(crate) fn hotwords_from_env() -> Vec<String> {
 
 // ─── 模型路径 ──────────────────────────────────────────────────────────
 
-/// engine 模型基础目录：从本项目 Cargo.toml 向上两级到 Desktop，
-/// 再进入 game-video/engine/models/streaming/。
+/// 本项目内的模型根目录：`models/streaming/`。
+/// Linux 版不再依赖 sibling game-video 仓库，流式与离线模型统一放在这里，
+/// 各自按子目录区分（见 `models.rs` 的 `MODEL_DESCS`）。
+pub(crate) fn models_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/streaming")
+}
+
+/// 流式模型基础目录：可用 `ENGINE_MODELS_DIR` 覆盖。
 pub(crate) fn engine_models_dir() -> PathBuf {
-    // 优先用环境变量覆盖，方便灵活部署。
     if let Ok(dir) = std::env::var("ENGINE_MODELS_DIR") {
         return PathBuf::from(dir);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../game-video/engine/models/streaming")
+    models_dir()
 }
 
-/// 离线模型（Canary 等）目录：本项目下的 models/streaming/。
-/// 与流式模型分开存放——流式模型沿用 sibling game-video 仓库，
-/// 离线模型体积大、独立性强，放本仓库更清晰。
+/// 离线模型（Canary / Parakeet 等）目录：可用 `OFFLINE_MODELS_DIR` 覆盖。
 pub(crate) fn offline_models_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("OFFLINE_MODELS_DIR") {
         return PathBuf::from(dir);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/streaming")
+    models_dir()
 }
 
+/// Silero VAD 模型路径：可用 `SILERO_VAD_MODEL` 覆盖。
 pub(crate) fn silero_vad_model_path() -> PathBuf {
     if let Ok(path) = std::env::var("SILERO_VAD_MODEL") {
         return PathBuf::from(path);

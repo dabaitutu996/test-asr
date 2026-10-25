@@ -42,7 +42,8 @@ pub(crate) fn create_silero_vad(
         debug: false,
     };
     with_stdout_suppressed(|| {
-        VoiceActivityDetector::create(&cfg, buffer_sec).context("创建 Silero VoiceActivityDetector 失败")
+        VoiceActivityDetector::create(&cfg, buffer_sec)
+            .context("创建 Silero VoiceActivityDetector 失败")
     })
 }
 

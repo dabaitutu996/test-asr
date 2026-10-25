@@ -3,7 +3,7 @@
 //! 启动时进入选择界面，用 1-9 勾选要加载的引擎，Enter 确认，q 退出。
 //! 运行中：q / Esc / Ctrl-C 退出；c 清空历史；1-9 切换引擎启用/禁用。
 //!
-//! 模型路径指向 game-video/engine/models/streaming/。
+//! 模型路径默认为本仓库 `models/streaming/`（可用 `ENGINE_MODELS_DIR` 覆盖）。
 //! 运行：cargo run
 //!
 //! 代码按职责拆分为多个模块：

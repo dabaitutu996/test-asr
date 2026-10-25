@@ -40,9 +40,9 @@ pub(crate) struct SegConfig {
 
 /// 连接词/功能词列表：切点结尾命中则不切。
 const CONNECTION_WORDS: &[&str] = &[
-    "and", "a", "an", "the", "this", "these", "those", "my", "your", "his", "her", "their",
-    "our", "its", "or", "but", "for", "to", "with", "because", "that", "of", "in", "on", "at",
-    "from", "into", "until", "if", "when", "while", "as", "so",
+    "and", "a", "an", "the", "this", "these", "those", "my", "your", "his", "her", "their", "our",
+    "its", "or", "but", "for", "to", "with", "because", "that", "of", "in", "on", "at", "from",
+    "into", "until", "if", "when", "while", "as", "so",
 ];
 
 /// 句末标点（切句信号）
@@ -194,11 +194,7 @@ impl Segmenter {
     // ── 主入口 ──────────────────────────────────────────────────────────
 
     /// 喂入新的 partial 文本。返回 `Some(SegmentAction)` 表示触发了切句。
-    pub(crate) fn feed_partial(
-        &mut self,
-        partial: &str,
-        now: Instant,
-    ) -> Option<SegmentAction> {
+    pub(crate) fn feed_partial(&mut self, partial: &str, now: Instant) -> Option<SegmentAction> {
         let partial = partial.trim();
 
         // 空 partial：重置候选但不触发任何动作
@@ -267,7 +263,10 @@ impl Segmenter {
             cut
         } else {
             // 向前找最近的合法边界
-            (0..cut).rev().find(|&i| partial.is_char_boundary(i)).unwrap_or(0)
+            (0..cut)
+                .rev()
+                .find(|&i| partial.is_char_boundary(i))
+                .unwrap_or(0)
         };
         &partial[safe_cut..]
     }
@@ -461,8 +460,8 @@ impl Segmenter {
             return None;
         }
         // 通过最后一个要提交的 word 的字节位置确定切点
-        let cut_pos = Self::find_nth_word_end(partial, keep_start.saturating_sub(1))
-            .unwrap_or(partial.len());
+        let cut_pos =
+            Self::find_nth_word_end(partial, keep_start.saturating_sub(1)).unwrap_or(partial.len());
 
         // 连接词保护
         if Self::ends_with_connection_word(&partial[..cut_pos]) {
@@ -732,9 +731,17 @@ mod tests {
         let t0 = now();
 
         // 无标点的长文本持续 25s
-        assert!(seg.feed_partial("no punctuation at all just words going on and on and on and on", t0).is_none());
+        assert!(seg
+            .feed_partial(
+                "no punctuation at all just words going on and on and on and on",
+                t0
+            )
+            .is_none());
         let t1 = advance(t0, 26.0);
-        let action = seg.feed_partial("no punctuation at all just words going on and on and on and on even more", t1);
+        let action = seg.feed_partial(
+            "no punctuation at all just words going on and on and on and on even more",
+            t1,
+        );
         assert!(action.is_some());
         match action.unwrap() {
             SegmentAction::ExtremeReset { .. } => {}
@@ -770,7 +777,11 @@ mod tests {
             SegmentAction::Checkpoint { draft, .. } => {
                 assert!(!draft.is_empty());
                 let draft_words: Vec<&str> = draft.split_whitespace().collect();
-                assert_eq!(draft_words.len(), 3, "draft should keep last 3 words, got: {draft}");
+                assert_eq!(
+                    draft_words.len(),
+                    3,
+                    "draft should keep last 3 words, got: {draft}"
+                );
             }
             _ => panic!("expected Checkpoint"),
         }
@@ -877,13 +888,21 @@ mod tests {
 
         // 紧接着第二句——如果计时基线没重置，极端兜底会误触发
         let t2 = advance(t1, 0.5);
-        let _ = seg.feed_partial("This is first sentence. Another whole new sentence here.", t2);
+        let _ = seg.feed_partial(
+            "This is first sentence. Another whole new sentence here.",
+            t2,
+        );
         let t3 = advance(t2, 1.0);
-        let action = seg.feed_partial("This is first sentence. Another whole new sentence here.", t3);
+        let action = seg.feed_partial(
+            "This is first sentence. Another whole new sentence here.",
+            t3,
+        );
         // 应该正常标点切句，不是极端强切
         match action {
             Some(SegmentAction::Checkpoint { .. }) => {} // OK
-            Some(SegmentAction::ExtremeReset { .. }) => panic!("should not extreme-reset after normal checkpoint"),
+            Some(SegmentAction::ExtremeReset { .. }) => {
+                panic!("should not extreme-reset after normal checkpoint")
+            }
             _ => {} // might need more time or words
         }
         assert_eq!(seg.stats.extreme_cut_count, 0);

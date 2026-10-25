@@ -3,7 +3,7 @@ target/
 /ARC_Raiders_is_getting_DARKER....f400.mp4.part
 /ARC_Raiders_is_getting_DARKER....mp3
 
-# ASR 模型（体积大，不提交；按需用 scripts/download-canary.sh 拉取）
+# ASR 模型（体积大，不提交；按需用 scripts/download-models.sh 拉取）
 models/
 # 导出的对比报告
 reports/
@@ -12,4 +12,3 @@ reports/
 
 /docs
 /open_asr_leaderboard/
-/scripts/download-*.sh

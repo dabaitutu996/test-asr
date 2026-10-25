@@ -143,15 +143,12 @@ pub(crate) fn draw(app: &App, frame: &mut ratatui::Frame) {
     let mut log_lines: Vec<Line> = Vec::new();
 
     // 收集 segmenter 统计摘要（所有启用了自定义 endpoint 的在线槽）
-    let stats_summary: Option<String> = app
-        .slots
-        .iter()
-        .find_map(|slot| match slot {
-            crate::engine::AnySlot::Online(s) if s.use_custom_endpoint => {
-                s.segmenter.as_ref().map(|seg| seg.stats.summary_line())
-            }
-            _ => None,
-        });
+    let stats_summary: Option<String> = app.slots.iter().find_map(|slot| match slot {
+        crate::engine::AnySlot::Online(s) if s.use_custom_endpoint => {
+            s.segmenter.as_ref().map(|seg| seg.stats.summary_line())
+        }
+        _ => None,
+    });
 
     if let Some(ref summary) = stats_summary {
         log_lines.push(Line::from(Span::styled(
@@ -161,7 +158,12 @@ pub(crate) fn draw(app: &App, frame: &mut ratatui::Frame) {
         log_lines.push(Line::from(""));
     }
 
-    for s in app.log.iter().rev().take(if stats_summary.is_some() { 4 } else { 5 }) {
+    for s in app
+        .log
+        .iter()
+        .rev()
+        .take(if stats_summary.is_some() { 4 } else { 5 })
+    {
         log_lines.push(Line::from(s.clone()));
     }
     let log_title = if stats_summary.is_some() {

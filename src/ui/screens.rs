@@ -12,8 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 
-use arcvoice_core::asr::Language;
-use asr_compare_tui::system_audio::OutputDevice;
+use asr_compare_tui::system_audio::AudioDevice;
 
 use crate::capture::{list_inputs, list_outputs, list_sample_files, Capture, DevicePick};
 use crate::models::{SlotKind, MODEL_DESCS};
@@ -65,10 +64,7 @@ pub(crate) fn run_selection_screen(
                 } else {
                     "[ ] "
                 };
-                let lang = match desc.language {
-                    Language::Chinese => "中文",
-                    Language::English => "英文",
-                };
+                let lang = desc.language.label();
                 let kind_tag = match desc.kind {
                     SlotKind::Online(_) => {
                         if desc.is_enhanced() {
@@ -82,7 +78,9 @@ pub(crate) fn run_selection_screen(
                 let style = if !ok {
                     Style::default().fg(Color::DarkGray)
                 } else if desc.is_enhanced() && selected[i] {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else if selected[i] {
                     Style::default().fg(Color::Green)
                 } else {
@@ -111,6 +109,13 @@ pub(crate) fn run_selection_screen(
                 ]));
             }
             lines.push(Line::from(""));
+            if !available.iter().any(|&ok| ok) {
+                lines.push(Line::from(Span::styled(
+                    " 未找到任何模型文件。先运行 ./scripts/download-models.sh 下载模型。",
+                    Style::default().fg(Color::Red),
+                )));
+                lines.push(Line::from(""));
+            }
             lines.push(Line::from(Span::styled(
                 " 1-9 勾选模型 · Enter 确认 · q 退出 ",
                 Style::default().fg(Color::DarkGray),
@@ -121,7 +126,7 @@ pub(crate) fn run_selection_screen(
 
             let count = selected.iter().filter(|&&s| s).count();
             let hint = if count == 0 {
-                " 请至少选择一个引擎".to_string()
+                " 请至少选择一个引擎（若列表全灰，先下载模型）".to_string()
             } else {
                 format!(" 将加载 {count} 个引擎（模型较大，加载需几秒）")
             };
@@ -165,11 +170,15 @@ pub(crate) fn run_selection_screen(
 
 // ─── 设备选择屏 ───────────────────────────────────────────────────────
 
+/// 设备选择屏的返回值：选中的采集源 + 当时枚举到的输入/输出列表。
+/// `None` 表示用户按 q/Esc 取消。
+pub(crate) type DeviceSelection = Option<(DevicePick, Vec<AudioDevice>, Vec<AudioDevice>)>;
+
 /// 上下两区列出输入/输出设备，方向键跨区扁平导航，Enter 选中。
 /// 返回 Some(pick) 表示用户已选定；None 表示按 q/Esc 取消（退回模型选择屏）。
 pub(crate) fn run_device_screen(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-) -> Result<Option<(DevicePick, Vec<String>, Vec<OutputDevice>)>> {
+) -> Result<DeviceSelection> {
     // 进入时一次性枚举。失败用空列表，UI 会显示「无可用设备」。
     let inputs = list_inputs();
     let outputs = list_outputs();
@@ -227,7 +236,7 @@ pub(crate) fn run_device_screen(
                     Style::default().fg(Color::DarkGray),
                 )));
             }
-            for (i, name) in inputs.iter().enumerate() {
+            for (i, device) in inputs.iter().enumerate() {
                 let flat = i;
                 let mark = if flat == cursor { "▸" } else { " " };
                 let style = if flat == cursor {
@@ -240,7 +249,7 @@ pub(crate) fn run_device_screen(
                 in_lines.push(Line::from(vec![
                     Span::raw(format!(" {mark} ")),
                     Span::styled(format!("[I{}] ", i + 1), Style::default().fg(Color::Cyan)),
-                    Span::styled(name.clone(), style),
+                    Span::styled(device.name.clone(), style),
                 ]));
             }
             let in_para = Paragraph::new(in_lines).block(
@@ -349,9 +358,9 @@ pub(crate) fn run_device_screen(
                     }
                     KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
                         if cursor < inputs.len() {
-                            let name = inputs[cursor].clone();
+                            let uid = inputs[cursor].uid.clone();
                             return Ok(Some((
-                                DevicePick::Input(name),
+                                DevicePick::Input(uid),
                                 inputs.clone(),
                                 outputs.clone(),
                             )));
@@ -387,8 +396,8 @@ pub(crate) fn run_device_screen(
 pub(crate) fn run_preview_screen(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     pick: &DevicePick,
-    inputs: &[String],
-    outputs: &[OutputDevice],
+    inputs: &[AudioDevice],
+    outputs: &[AudioDevice],
 ) -> Result<Option<Capture>> {
     let label = pick.label(inputs, outputs);
     let mut capture = match Capture::start(pick) {
@@ -410,7 +419,7 @@ pub(crate) fn run_preview_screen(
             rms_disp = rms(&frame).max(rms_disp * 0.9);
         }
 
-        let show_output_tcc_hint = matches!(pick, DevicePick::Output(_))
+        let show_silence_hint = matches!(pick, DevicePick::Output(_) | DevicePick::Input(_))
             && received_frames == 0
             && preview_started_at.elapsed() >= Duration::from_secs(3);
 
@@ -433,14 +442,24 @@ pub(crate) fn run_preview_screen(
                 Line::from(""),
                 Line::from(Span::styled(preview_hint_for_pick(pick), Style::default().fg(Color::DarkGray))),
             ];
-            if show_output_tcc_hint {
+            if show_silence_hint {
                 info_lines.push(Line::from(""));
+                let (line1, line2) = match pick {
+                    DevicePick::Output(_) => (
+                        " 3 秒内仍未收到系统音频帧：确认该输出设备上确实有声音在播放。",
+                        " 可用 pavucontrol 查看播放流，或用 cargo run --example diag_devices -- --capture 验证。",
+                    ),
+                    _ => (
+                        " 3 秒内仍未收到麦克风数据：确认 source 未被 suspend、麦克风未被静音。",
+                        " 可用 cargo run --example diag_devices -- --capture 逐个 source 实测。",
+                    ),
+                };
                 info_lines.push(Line::from(Span::styled(
-                    " 3 秒内仍未收到任何系统音频帧：若你是从终端 cargo run，macOS 可能在 TCC 层拒绝了 AudioCapture。",
+                    line1,
                     Style::default().fg(Color::Yellow),
                 )));
                 info_lines.push(Line::from(Span::styled(
-                    " 常见场景是终端宿主缺少 NSAudioCaptureUsageDescription；请改用带该键的 .app 宿主或先跑 diag_devices 核对。",
+                    line2,
                     Style::default().fg(Color::Yellow),
                 )));
             }

@@ -5,20 +5,19 @@
 //! - 新路径（`use_custom_endpoint = true`）：自定义 segmenter + 收尾 VAD
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineStream, VoiceActivityDetector};
 
-use arcvoice_core::asr::streaming::SherpaModelType;
-
 use crate::config::{
     endpoint_rules_from_env, engine_models_dir, hotwords_from_env, silero_vad_model_path,
     FINALS_RETAIN, PARTIAL_HISTORY_RETAIN, VAD_SAMPLE_RATE,
 };
-use crate::models::{ModelDesc, SlotKind};
+use crate::models::{
+    online_feature_dim, online_model_files, ModelDesc, SherpaModelType, SlotKind, DOWNLOAD_SCRIPT,
+};
 use crate::segments::{SegConfig, SegmentAction, Segmenter};
 use crate::util::with_stdout_suppressed;
 use crate::vad::create_silero_vad;
@@ -54,7 +53,14 @@ pub(crate) fn build_online_slot(
         SlotKind::Offline(_) => bail!("build_online_slot 收到离线模型"),
     };
     let (rule1, rule2, rule3) = endpoint_rules_from_env();
-    let files = online_model_files(desc.name, &model_dir, model_type)?;
+    let files = online_model_files(&model_dir, model_type).with_context(|| {
+        format!(
+            "{} 模型文件缺失：目录 {}（先运行 {} 下载模型）",
+            desc.name,
+            model_dir.display(),
+            DOWNLOAD_SCRIPT
+        )
+    })?;
     let hotwords = if matches!(model_type, SherpaModelType::Zipformer) {
         hotwords_from_env()
     } else {
@@ -116,9 +122,9 @@ pub(crate) fn build_online_slot(
                 &vad_model_path,
                 config.vad_threshold,
                 config.vad_min_silence_sec,
-                0.0,                          // min_speech_sec = 0（一检测到就开始）
+                0.0, // min_speech_sec = 0（一检测到就开始）
                 config.vad_max_speech_sec,
-                5.0,                          // buffer_sec
+                5.0, // buffer_sec
             )?)
         } else {
             eprintln!(
@@ -291,58 +297,5 @@ fn apply_segment_action(slot: &mut OnlineSlot, action: SegmentAction) -> Option<
             }
             Some(text)
         }
-    }
-}
-
-struct OnlineModelFiles {
-    encoder: PathBuf,
-    decoder: PathBuf,
-    joiner: PathBuf,
-    tokens: PathBuf,
-}
-
-fn online_model_files(
-    name: &str,
-    model_dir: &Path,
-    model_type: SherpaModelType,
-) -> Result<OnlineModelFiles> {
-    Ok(OnlineModelFiles {
-        encoder: first_existing_model_file(
-            name,
-            model_dir,
-            &["encoder.int8.onnx", "encoder.onnx"],
-        )?,
-        decoder: first_existing_model_file(
-            name,
-            model_dir,
-            match model_type {
-                SherpaModelType::NemotronStreaming => &["decoder.int8.onnx", "decoder.onnx"],
-                SherpaModelType::Zipformer => &["decoder.onnx", "decoder.int8.onnx"],
-            },
-        )?,
-        joiner: first_existing_model_file(name, model_dir, &["joiner.int8.onnx", "joiner.onnx"])?,
-        tokens: first_existing_model_file(name, model_dir, &["tokens.txt"])?,
-    })
-}
-
-fn first_existing_model_file(name: &str, model_dir: &Path, candidates: &[&str]) -> Result<PathBuf> {
-    candidates
-        .iter()
-        .map(|filename| model_dir.join(filename))
-        .find(|path| path.exists())
-        .with_context(|| {
-            format!(
-                "{} 模型文件缺失: 需要 {} 之一，目录 {}",
-                name,
-                candidates.join(" / "),
-                model_dir.display()
-            )
-        })
-}
-
-fn online_feature_dim(model_type: SherpaModelType) -> i32 {
-    match model_type {
-        SherpaModelType::NemotronStreaming => 128,
-        SherpaModelType::Zipformer => 80,
     }
 }

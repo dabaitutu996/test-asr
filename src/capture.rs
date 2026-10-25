@@ -1,4 +1,4 @@
-//! 设备选择与采集抽象：把 system_audio（Process Tap）、mic（cpal）
+//! 设备选择与采集抽象：把 system_audio（PulseAudio source / monitor source）
 //! 和本地示例音频文件收拢成统一的 `Capture` 接口。
 
 use std::path::{Path, PathBuf};
@@ -9,11 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait};
 use tokio::sync::mpsc;
 
-use arcvoice_core::audio::mic::MicInput;
-use asr_compare_tui::system_audio::{self, OutputDevice};
+use asr_compare_tui::system_audio::{self, AudioDevice};
 
 use crate::config::{DEFAULT_MEDIA_MP3, VAD_SAMPLE_RATE};
 
@@ -23,7 +21,7 @@ const FILE_FLUSH_CHUNKS: usize = 15;
 const MAX_SAMPLE_FILE_SAMPLES: usize = 50_000_000;
 
 /// 用户在设备选择屏挑中的采集源。
-/// Input 存 cpal 用的设备名，Output 存 CoreAudio 的设备 UID。
+/// Input 存 PulseAudio source 名，Output 存对应输出设备的 monitor source 名。
 pub(crate) enum DevicePick {
     Input(String),
     Output(String),
@@ -31,15 +29,16 @@ pub(crate) enum DevicePick {
 }
 
 impl DevicePick {
-    /// 给 UI 显示用的标签，如「输入端 / MacBook 麦克风」。
-    pub(crate) fn label(&self, _inputs: &[String], outputs: &[OutputDevice]) -> String {
+    /// 给 UI 显示用的标签，如「输入端 / Wireless Mic Rx」。
+    pub(crate) fn label(&self, inputs: &[AudioDevice], outputs: &[AudioDevice]) -> String {
         match self {
-            DevicePick::Input(name) => {
-                if name == "default" {
-                    "输入端 / 默认麦克风".to_string()
-                } else {
-                    format!("输入端 / {name}")
-                }
+            DevicePick::Input(uid) => {
+                let dev_name = inputs
+                    .iter()
+                    .find(|d| &d.uid == uid)
+                    .map(|d| d.name.as_str())
+                    .unwrap_or(uid);
+                format!("输入端 / {dev_name}")
             }
             DevicePick::Output(uid) => {
                 let dev_name = outputs
@@ -60,7 +59,7 @@ impl DevicePick {
     }
 }
 
-/// 把 system_audio（Process Tap）、mic（cpal）和文件音频收拢成统一接口。
+/// 把 system_audio（PulseAudio source / monitor source）和文件音频收拢成统一接口。
 /// 预览屏和主屏都只跟 Capture 打交道，不再 if 分支。
 pub(crate) struct Capture {
     pub(crate) rx: mpsc::Receiver<Vec<f32>>,
@@ -70,12 +69,10 @@ pub(crate) struct Capture {
 }
 
 enum CaptureGuard {
-    System {
-        _tap: system_audio::SystemAudioTap,
-    },
-    Mic {
-        _mic: MicInput,
-    },
+    /// 系统音频（输出设备的 monitor source）
+    Output { _tap: system_audio::PulseCapture },
+    /// 麦克风（PulseAudio source）
+    Input { _tap: system_audio::PulseCapture },
     File {
         control: Arc<Mutex<FileCaptureState>>,
         total_samples: usize,
@@ -100,20 +97,16 @@ impl Capture {
                 Ok(Capture {
                     rx,
                     stop_flag,
-                    _guard: CaptureGuard::System { _tap: tap },
+                    _guard: CaptureGuard::Output { _tap: tap },
                 })
             }
-            DevicePick::Input(name) => {
-                let resolved = if name.is_empty() {
-                    "default"
-                } else {
-                    name.as_str()
-                };
-                let (mic, rx) = MicInput::start_selected_with_stop(resolved, stop_flag.clone())?;
+            DevicePick::Input(uid) => {
+                let rebuild = Arc::new(AtomicBool::new(false));
+                let (tap, rx) = system_audio::start_source(stop_flag.clone(), rebuild, uid)?;
                 Ok(Capture {
                     rx,
                     stop_flag,
-                    _guard: CaptureGuard::Mic { _mic: mic },
+                    _guard: CaptureGuard::Input { _tap: tap },
                 })
             }
             DevicePick::SampleFile(path) => {
@@ -205,25 +198,18 @@ impl Drop for Capture {
     }
 }
 
-/// 枚举输入端（麦克风）。cpal 失败时返回空 Vec，由调用方处理。
-pub(crate) fn list_inputs() -> Vec<String> {
-    let host = cpal::default_host();
-    match host.input_devices() {
-        Ok(devs) => devs
-            .filter_map(|d| d.name().ok())
-            .filter(|n| !n.trim().is_empty())
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+/// 枚举输入端（PulseAudio sources，排除 monitor）。
+pub(crate) fn list_inputs() -> Vec<AudioDevice> {
+    let mut devices = system_audio::list_input_devices().unwrap_or_default();
+    devices.dedup_by(|a, b| a.uid == b.uid);
+    devices
 }
 
-/// 枚举输出端（扬声器/系统音频）。
-/// core 的 `list_output_devices()` 已按 Output scope 通道数过滤掉麦克风，
-/// 这里只做同名去重（虚拟声卡多实例场景）。
-pub(crate) fn list_outputs() -> Vec<OutputDevice> {
-    let mut raw = system_audio::list_output_devices().unwrap_or_default();
-    raw.dedup_by(|a, b| a.name == b.name && a.uid == b.uid);
-    raw
+/// 枚举输出端（扬声器/系统音频），每个输出设备对应它的 monitor source。
+pub(crate) fn list_outputs() -> Vec<AudioDevice> {
+    let mut devices = system_audio::list_output_devices().unwrap_or_default();
+    devices.dedup_by(|a, b| a.uid == b.uid);
+    devices
 }
 
 /// 枚举可直接送入 ASR 的示例音频文件。

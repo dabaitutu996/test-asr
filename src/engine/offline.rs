@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 
 use crate::config::{offline_models_dir, FINALS_RETAIN, VAD_SAMPLE_RATE};
-use crate::models::{ModelDesc, OfflineFamily, SlotKind};
+use crate::models::{ModelDesc, OfflineFamily, SlotKind, DOWNLOAD_SCRIPT};
 use crate::util::with_stdout_suppressed;
 use crate::vad::VadSegment;
 
@@ -35,9 +35,9 @@ pub(crate) fn build_offline_slot(desc: &ModelDesc) -> Result<OfflineSlot> {
 
     match family {
         OfflineFamily::Canary => {
-            let encoder = require_offline_file(desc, family, "encoder", "encoder.int8.onnx")?;
-            let decoder = require_offline_file(desc, family, "decoder", "decoder.int8.onnx")?;
-            let tokens = require_offline_file(desc, family, "tokens", "tokens.txt")?;
+            let encoder = require_offline_file(desc, "encoder", "encoder.int8.onnx")?;
+            let decoder = require_offline_file(desc, "decoder", "decoder.int8.onnx")?;
+            let tokens = require_offline_file(desc, "tokens", "tokens.txt")?;
 
             // Canary 用 128 维 mel filterbank（sherpa-onnx 默认 80，必须显式设置）。
             cfg.feat_config.feature_dim = 128;
@@ -49,8 +49,8 @@ pub(crate) fn build_offline_slot(desc: &ModelDesc) -> Result<OfflineSlot> {
             cfg.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
         }
         OfflineFamily::ParakeetNemoCtc => {
-            let model = require_offline_file(desc, family, "model", "model.int8.onnx")?;
-            let tokens = require_offline_file(desc, family, "tokens", "tokens.txt")?;
+            let model = require_offline_file(desc, "model", "model.int8.onnx")?;
+            let tokens = require_offline_file(desc, "tokens", "tokens.txt")?;
 
             cfg.model_config.nemo_ctc.model = Some(model.to_string_lossy().into_owned());
             cfg.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
@@ -80,12 +80,7 @@ pub(crate) fn build_offline_slot(desc: &ModelDesc) -> Result<OfflineSlot> {
     })
 }
 
-fn require_offline_file(
-    desc: &ModelDesc,
-    family: OfflineFamily,
-    label: &str,
-    filename: &str,
-) -> Result<PathBuf> {
+fn require_offline_file(desc: &ModelDesc, label: &str, filename: &str) -> Result<PathBuf> {
     let path = offline_models_dir().join(desc.subdir).join(filename);
     if path.exists() {
         return Ok(path);
@@ -95,7 +90,7 @@ fn require_offline_file(
         desc.name,
         label,
         path.display(),
-        family.download_script()
+        DOWNLOAD_SCRIPT
     );
 }
 
