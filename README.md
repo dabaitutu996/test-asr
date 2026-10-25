@@ -32,11 +32,12 @@
 - 运行中的 PipeWire 或 PulseAudio（PipeWire 走 pulse 兼容层即可）
 - `ffmpeg`：把示例音频解码成 16kHz PCM；`ffplay` 可选，用于播放测试音频
 - `pactl` / `parec`：输入（麦克风）与输出（monitor source）采集都走 PulseAudio 协议层
+- `zstd`（可选）：从本仓库模型镜像下载时需要；没装则自动回退到上游 `.tar.bz2`
 
 Debian / Ubuntu：
 
 ```bash
-sudo apt install build-essential pulseaudio-utils ffmpeg
+sudo apt install build-essential pulseaudio-utils ffmpeg zstd
 ```
 
 首次 `cargo build` 时，`sherpa-onnx-sys` 会自动从 GitHub Releases 下载
@@ -46,12 +47,23 @@ sudo apt install build-essential pulseaudio-utils ffmpeg
 ## 运行
 
 ```bash
-# 1. 下载模型（Zipformer 中/英 + Silero VAD，约 200MB）
+# 1. 下载模型
+#    默认（Zipformer 中/英 + Silero VAD，约 100MB）：
 ./scripts/download-models.sh
+#    要跑全部 6 个模型对比（追加 Nemotron / Canary / Parakeet，约 750MB）：
+./scripts/download-models.sh --all
 
 # 2. 构建并启动
 cargo run
 # 或 ./测试
+```
+
+模型优先从本仓库的 [Release 镜像](https://github.com/dabaitutu996/test-asr/releases/tag/models-v1)
+下载（`tar.zst` + `SHA256SUMS` 校验），镜像不可用时自动回退到 sherpa-onnx 官方
+`asr-models` release。想强制走上游：
+
+```bash
+MODELS_SOURCE=upstream ./scripts/download-models.sh
 ```
 
 启动后：
@@ -79,8 +91,12 @@ cargo run
 | `zipformer-en-enhanced/` | 复用 `zipformer-en` 模型，仅切句策略不同 |
 | `nemotron-en/` | `sherpa-onnx-nemotron-speech-streaming-en-0.6b-int8-*` |
 | `canary-180m-flash/` | `sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8` |
-| `parakeet-tdt-ctc-110m/` | 需自行从 sherpa-onnx 的 `asr-models` release 下载解包 |
+| `parakeet-tdt-ctc-110m/` | `sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8` |
 | `../vad/silero_vad/silero_vad.int8.onnx` | `silero_vad.onnx` |
+
+镜像包（release `models-v1`）只含应用实际需要的权重文件（`encoder*.onnx` /
+`decoder*.onnx` / `joiner*.onnx` / `model*.onnx` / `tokens.txt`），不含上游的
+`test_wavs/`、README 与导出脚本，用来做冒烟测试请另外从上游 release 取 WAV。
 
 覆盖方式：
 
@@ -150,7 +166,9 @@ scripts/download-models.sh 模型下载（流式 / 离线 / VAD）
 
 - 采集依赖 PulseAudio 协议层：纯 ALSA / 无音频服务时只能选示例文件（仍可验证模型与 UI）。
 - 设备自身的默认采样率不是 16kHz 时会由 PulseAudio 负责重采样（`parec --rate=16000`）。
-- Parakeet 的发布包名未在下载脚本中固化，需手动下载；缺失时选择屏会自动置灰。
+- 「示例文件」模式读取仓库根目录的 `ARC_Raiders_is_getting_DARKER....mp3`（及其 `.srt`），
+  该媒体文件不随仓库分发，需要自行放入；没有它时请用麦克风或系统音频。
+- 模型镜像走 `tar --zstd` 解压，机器上没有 `zstd` 时脚本会自动改用上游 `.tar.bz2`（下载更慢）。
 
 ## 关于 Moonshine
 
