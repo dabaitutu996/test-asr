@@ -72,7 +72,8 @@ MODELS_SOURCE=upstream ./scripts/download-models.sh
 2. **设备选择屏**：
    - 输入端 = 麦克风（PulseAudio source，已排除 monitor）
    - 输出端 = 系统音频，每个输出设备对应它的 monitor source
-   - 示例文件 = 仓库根目录的默认 mp3，无需任何音频服务即可跑通链路
+   - 示例文件 = 项目根目录的 `ARC_Raiders_is_getting_DARKER....mp3`（固定文件名，缺失时该项
+     显示"未找到默认示例 mp3"）；它不随仓库分发，需要自行放入，放好后无需音频服务即可跑通链路
 3. **预览屏**：观察电平是否跳动，确认采集源正确。Enter 进入主屏。
 4. **主屏**：多列并行显示各模型的 partial / finals。
    - `←/→` 切换激活列 · `↑/↓` 滚动 finals · `PgUp/PgDn` 快滚
@@ -89,7 +90,7 @@ MODELS_SOURCE=upstream ./scripts/download-models.sh
 | `zipformer-zh/` | `sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23` |
 | `zipformer-en/` | `sherpa-onnx-streaming-zipformer-en-2023-06-26` |
 | `zipformer-en-enhanced/` | 复用 `zipformer-en` 模型，仅切句策略不同 |
-| `nemotron-en/` | `sherpa-onnx-nemotron-speech-streaming-en-0.6b-int8-*` |
+| `nemotron-en/` | `sherpa-onnx-nemotron-speech-streaming-en-0.6b-int8-2026-01-14` |
 | `canary-180m-flash/` | `sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8` |
 | `parakeet-tdt-ctc-110m/` | `sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8` |
 | `../vad/silero_vad/silero_vad.int8.onnx` | `silero_vad.onnx` |
@@ -97,6 +98,19 @@ MODELS_SOURCE=upstream ./scripts/download-models.sh
 镜像包（release `models-v1`）只含应用实际需要的权重文件（`encoder*.onnx` /
 `decoder*.onnx` / `joiner*.onnx` / `model*.onnx` / `tokens.txt`），不含上游的
 `test_wavs/`、README 与导出脚本，用来做冒烟测试请另外从上游 release 取 WAV。
+
+不想跑脚本时也可以手动取（以中文模型为例）：
+
+```bash
+BASE=https://github.com/dabaitutu996/test-asr/releases/download/models-v1
+curl -fLO "$BASE/asr-models-zipformer-zh.tar.zst" "$BASE/SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing
+tar --zstd -xf asr-models-zipformer-zh.tar.zst -C models/streaming
+```
+
+镜像里 zipformer 只带 `encoder.int8.onnx` + `decoder.onnx`（代码优先选这两个），
+如需完整权重（float encoder、int8 decoder 等）仍可用
+`MODELS_SOURCE=upstream ./scripts/download-models.sh` 从上游拿。
 
 覆盖方式：
 
@@ -128,10 +142,17 @@ VAD_BACKEND=rms VAD_RMS_THRESHOLD=0.02 cargo run
 
 | 环境变量 | 默认值 | 含义 |
 |---|---:|---|
-| `ASR_ENDPOINT_RULE1` | `0.8` | 尾部静音（秒）触发断句 |
+| `ASR_ENDPOINT_RULE1` | `2.4` | 尾部静音（秒）触发断句 |
 | `ASR_ENDPOINT_RULE2` | `1.2` | 含非静音后的尾部静音（秒） |
 | `ASR_ENDPOINT_RULE3` | `20.0` | 最长 utterance（秒） |
-| `ASR_HOTWORDS` | 空 | 中文/英文热词，空格分隔，`|` 后可加权 |
+| `ASR_HOTWORDS` | 空 | 热词，**逗号或换行**分隔；仅 Zipformer 生效 |
+
+热词会以"每行一个"的形式写入 `hotwords_buf`，统一使用 `hotwords_score = 2.0`，
+并自动把解码方式从 `greedy_search` 切到 `modified_beam_search`：
+
+```bash
+ASR_HOTWORDS="原神,显卡,RTX 5090" cargo run
+```
 
 ## 诊断
 
@@ -158,7 +179,7 @@ src/segments.rs         标点切句状态机（加强版模型）
 src/ui/                 选择屏 / 预览屏 / 主画面
 examples/diag_devices.rs   设备与采集诊断
 examples/transcribe_wav.rs WAV 冒烟测试
-scripts/download-models.sh 模型下载（流式 / 离线 / VAD）
+scripts/download-models.sh 模型下载（Release 镜像 + 上游回退）
 测试                     cargo run 的薄封装
 ```
 
